@@ -2,8 +2,8 @@
 
 - **Project:** Paragon Protocol (DEX + Payflow + Farm + DAO)
 - **Tag (frozen):** v1.0.0-audit
-- **Commit:** <TO_FILL>
-- **Package lock hash:** sha256(pnpm-lock.yaml)=<TO_FILL>
+- **Commit:** <98273f7f0117d518040b77d90229adcfdd9dbae0>
+- **Package lock hash:** sha256(pnpm-lock.yaml)=<DF038F04FAC28E92B912FF974AE9F35A153FD7E7504E65711FB668A51E3442BA>
 - **Solidity / Tooling Pins:**
   - Solidity: <0.8.25> (optimizer: enabled, runs=<200>)
   - Hardhat: <2.26.3>, ethers v6

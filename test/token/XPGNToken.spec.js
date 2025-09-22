@@ -5,6 +5,7 @@ const { loadFixture, time, mine } =
   require("@nomicfoundation/hardhat-toolbox/network-helpers");
 
 const E18 = (n) => ethers.parseEther(n.toString());
+const BI  = (x) => (typeof x === "bigint" ? x : BigInt(x)); // normalize to BigInt
 
 // Match contract constants
 const GENESIS = E18(10_000_000);
@@ -15,9 +16,10 @@ const TREASURY_CAP  = E18(33_999_999);
 const TEAM_CAP      = E18(55_000_000);
 const ADVISOR_CAP   = E18(11_000_000);
 
-const ECOSYSTEM_START_TIME = 1760486400; // Oct 15, 2025 UTC
-const ECOSYSTEM_MONTHLY_LIMIT = E18(450_000);
-const ECOSYSTEM_PERIOD = 30 * 24 * 60 * 60; // 30 days
+// Use BigInt for time constants
+const ECOSYSTEM_START_TIME    = 1760486400n;               // Oct 15, 2025 UTC
+const ECOSYSTEM_MONTHLY_LIMIT = E18(450_000);              // already BigInt
+const ECOSYSTEM_PERIOD        = 30n * 24n * 60n * 60n;     // 30 days
 
 // roles: keccak256("...") as in the contract
 const R = {
@@ -85,10 +87,13 @@ describe("XPGNToken", () => {
       .to.be.revertedWith("ADVISOR_TO_MUST_BE_VESTING");
     await token.connect(dao).mint(advisorVesting.address, E18(1), R.ADVISOR);
 
-    // Cap per bucket enforced (try to exceed with +1 wei)
-    await expect(token.connect(dao).mint(teamVesting.address, TEAM_CAP, R.TEAM)).to.not.be.reverted;
-    await expect(token.connect(dao).mint(teamVesting.address, 1n, R.TEAM))
-      .to.be.revertedWith("TEAM_CAP_EXCEEDED");
+    // Cap per bucket enforced (we already minted 1e18 above -> mint remaining, then +1 should revert)
+    await expect(
+      token.connect(dao).mint(teamVesting.address, TEAM_CAP - E18(1), R.TEAM)
+    ).to.not.be.reverted;
+    await expect(
+      token.connect(dao).mint(teamVesting.address, 1n, R.TEAM)
+    ).to.be.revertedWith("TEAM_CAP_EXCEEDED");
   });
 
   it("validator minting is gated by enable/disable toggle", async () => {
@@ -112,24 +117,36 @@ describe("XPGNToken", () => {
   it("ecosystem mint: not before start, ≤ monthly limit, one mint / 30 days window", async () => {
     const { token, dao, alice } = await loadFixture(deploy);
 
-    // Before start -> revert
-    await time.setNextBlockTimestamp(ECOSYSTEM_START_TIME - 10);
-    await mine();
-    await expect(token.connect(dao).mint(alice.address, E18(1), R.ECOSYS))
-      .to.be.revertedWith("ECOSYSTEM_NOT_STARTED");
+    const start = ECOSYSTEM_START_TIME;              // BigInt
+    const now0  = BI(await time.latest());           // normalize
 
-    // At/after start -> OK up to monthly limit
-    await time.setNextBlockTimestamp(ECOSYSTEM_START_TIME);
-    await mine();
+    // Only run "before start" check if chain time is actually before the configured start
+    if (now0 < start) {
+      await time.setNextBlockTimestamp(Number(start - 10n)); // cast for helper
+      await mine();
+      await expect(token.connect(dao).mint(alice.address, E18(1), R.ECOSYS))
+        .to.be.revertedWith("ECOSYSTEM_NOT_STARTED");
+    }
+
+    // Move to/start at ≥ start time
+    const now1 = BI(await time.latest());
+    if (now1 < start) {
+      await time.setNextBlockTimestamp(Number(start));
+      await mine();
+    }
+
+    // Mint up to monthly limit
     await token.connect(dao).mint(alice.address, ECOSYSTEM_MONTHLY_LIMIT, R.ECOSYS);
 
-    // More than limit -> revert
-    await time.setNextBlockTimestamp(ECOSYSTEM_START_TIME + 60); await mine();
+    // Still within cooldown window -> mint should revert with cooldown
+    const now2 = BI(await time.latest());
+    await time.setNextBlockTimestamp(Number(now2 + 60n));
+    await mine();
     await expect(token.connect(dao).mint(alice.address, 1n, R.ECOSYS))
       .to.be.revertedWith("ECOSYSTEM_COOLDOWN");
 
-    // Advance one period -> can mint again, but not above limit
-    await time.increase(ECOSYSTEM_PERIOD + 1);
+    // After 30d -> cannot exceed monthly limit; exactly limit is OK
+    await time.increase(Number(ECOSYSTEM_PERIOD + 1n));
     await expect(token.connect(dao).mint(alice.address, ECOSYSTEM_MONTHLY_LIMIT + 1n, R.ECOSYS))
       .to.be.revertedWith("ECOSYSTEM_MONTHLY_LIMIT");
     await token.connect(dao).mint(alice.address, ECOSYSTEM_MONTHLY_LIMIT, R.ECOSYS);
@@ -156,10 +173,13 @@ describe("XPGNToken", () => {
 
   it("EIP-2612 permit updates allowance and nonce", async () => {
     const { token, alice, bob } = await loadFixture(deploy);
-    const chainId = (await ethers.provider.getNetwork()).chainId;
 
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
+    // Use chain time (BigInt) for deadline to avoid drift
+    const deadline = BI(await time.latest()) + 3600n;
     const value = E18(42);
+
+    // Ethers v6 returns BigInt chainId; cast to Number for the domain
+    const chainId = Number((await ethers.provider.getNetwork()).chainId);
 
     const domain = {
       name: await token.name(),
@@ -180,8 +200,8 @@ describe("XPGNToken", () => {
       owner:   alice.address,
       spender: bob.address,
       value,
-      nonce: await token.nonces(alice.address),
-      deadline,
+      nonce: await token.nonces(alice.address), // BigInt OK
+      deadline,                                 // BigInt OK
     };
 
     const sig = await alice.signTypedData(domain, types, message);
