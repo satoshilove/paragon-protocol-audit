@@ -1,0 +1,66 @@
+Contract,Function,Role,TimelockHours,Bounds/Checks,Notes
+EmissionsMinter,setWeeklyEmission,Owner (DAO),72,amount>=0,Sets weekly emission (used by kick()).
+EmissionsMinter,setFundingMode,Owner (DAO),48,if useMinting=false then treasury!=0,Switches mint vs. treasury-funded transferFrom.
+EmissionsMinter,setController,Owner (DAO),48,nonzero address,Points to GaugeController used for weights.
+EmissionsMinter,kick,Public,0,once per week; weeklyEmission>0; n_gauges>0; totalWeight>0,Pulls funds (mint/transfer) and splits to gauges by weight.
+GaugeController,addGauge,Owner (DAO),48,nonzero; not already added,Registers a gauge.
+GaugeController,removeGauge,Owner (DAO),48,gauge exists,Removes gauge and zeros its weight.
+GaugeController,vote_for_gauge_weights,User,0,isGauge; bps<=10000; userUsed<=10000; ve.balanceOf(user)>0; 7d cooldown,Replaces the user's bps for that gauge; updates totals.
+GaugeController,clear_vote,User,0,prev>0; updates userUsed<=10000,Removes user's vote from a gauge.
+GaugeController,pause,Owner (DAO/Guardian),48 (0 if Guardian),only when not paused,Stops voting.
+GaugeController,unpause,Owner (DAO),48,only when paused,Resume voting after review.
+SimpleGauge,setMinter,Owner (DAO),48,any address (0 disables),Auth that can call notifyRewardAmount.
+SimpleGauge,notifyRewardAmount,Owner or Minter,0,amount>0; smooths over 7d; pulls tokens via transferFrom,Refills rewards and updates rate.
+SimpleGauge,stake,User,0,amount>0,LP in.
+SimpleGauge,withdraw,User,0,amount>0,LP out.
+SimpleGauge,getReward,User,0,none,Pays accrued XPGN to user.
+SimpleGauge,pause,Owner (DAO/Guardian),48 (0 if Guardian),only when not paused,Stops stake/withdraw/getReward.
+SimpleGauge,unpause,Owner (DAO),48,only when paused,Resume after review.
+FeeDistributorERC20,notifyRewardAmount,Public,0,amount>0; snapshots supply at weekEnd,Funds current epoch; end-of-week snapshot.
+FeeDistributorERC20,claim,Public,0,user!=0; completed weeks only,Pays user across completed epochs.
+FeeDistributorERC20,pause,Owner (DAO/Guardian),48 (0 if Guardian),only when not paused,Freezes notify/claim.
+FeeDistributorERC20,unpause,Owner (DAO),48,only when paused,Resume after review.
+GaugeEmitterToFarmBps,setFarm,Owner (DAO),48,nonzero address,Where rewards are forwarded.
+GaugeEmitterToFarmBps,setPoolId,Owner (DAO),48,any uint; mapping required per gauge,Maps gauge -> farm pid.
+GaugeEmitterToFarmBps,notifyRewardAmount,Owner (DAO/Treasury),48,amount>0; totalWeight>0; mapped pid required,Pulls tokens from owner, forwards to farm and calls notify on farm.
+VoterEscrow,create_lock,User,0,amount>0; end>now; end<=now+MAXTIME; end rounded to week,Creates a new lock.
+VoterEscrow,increase_amount,User,0,amount>0; lock exists & not expired,Adds to existing lock.
+VoterEscrow,increase_unlock_time,User,0,newEnd>oldEnd; newEnd<=now+MAXTIME; rounded to week,Extends lock end.
+VoterEscrow,withdraw,User,0,now>=end,Withdraws principal; updates global slope/bias.
+VoterEscrow,checkpoint,Public,0,none,Updates global slope/bias to now.
+VoterEscrow,pause,Owner (DAO/Guardian),48 (0 if Guardian),only when not paused,Stops lock/extend/amount increase.
+VoterEscrow,unpause,Owner (DAO),48,only when paused,Resume after review.
+ParagonLockingVault,deposit,User,0,amount>0; !emergency,Pulls LP; stakes into farm; mints shares per tier.
+ParagonLockingVault,claim,User,0,none,Pays pending for a position.
+ParagonLockingVault,claimAll,User,0,none,Aggregates claims across positions.
+ParagonLockingVault,unlock,User,0,!emergency OR now>=unlockTime,Withdraws LP when unlocked; pays pending.
+ParagonLockingVault,unlockEarly,User,0,position exists; applies penalty,Burns shares; sends penalty to DAO.
+ParagonLockingVault,harvest,Public,0,none,Pull farm rewards into vault; update accRPS.
+ParagonLockingVault,setParams,Owner (DAO),48,multipliers>0; lock durations set,Tier durations & multipliers.
+ParagonLockingVault,setEarlyPenaltyBips,Owner (DAO),48,0<=bips<=10000,Penalty applied on early unlock.
+ParagonLockingVault,setEmergencyMode,Owner (DAO/Guardian),48 (0 if Guardian),flag toggle,Blocks new deposits; allows unlocks immediately.
+ParagonLockingVault,setDao,Owner (DAO),48,nonzero,Recipient of penalties.
+ParagonLockingVault,rescueToken,Owner (DAO),48,to!=0; token!=LP && token!=reward,Emergency sweep of stray tokens.
+UsagePoints,setCaller,Owner (DAO),48,any address; bool,Allow-list notifiers (e.g., Payflow Executor).
+UsagePoints,setWeights,Owner (DAO),48,vol<=20000; saved<=50000,Weight caps enforced on-chain.
+UsagePoints,setDailyCap,Owner (DAO),48,any uint,Per-user daily cap in 1e18 points.
+UsagePoints,pause,Owner (DAO/Guardian),48 (0 if Guardian),only when not paused,Stops point accrual.
+UsagePoints,unpause,Owner (DAO),48,only when paused,Resume after review.
+UsagePoints,onPayflowExecuted,OnlyCaller,0,caller allow-listed; applies cap & weights,Accrues points for current epoch/day.
+TraderRewardsLocker,notifyRewardAmount,Treasury/any,0,amount>0; pulls XPGN into locker,Funds epoch budget.
+TraderRewardsLocker,claim,User,0,points>0; total>0; budget>0,Auto-locks share into ve; optional kickback.
+TraderRewardsLocker,claimFor,Public (any),0,same as claim; receiver!=0,3rd-party relay to receiver.
+TraderRewardsLocker,setLockConfig,Owner (DAO),48,minWeeks>=1; maxWeeks<=208; max>=min; kickback<=1000,Configures lock horizon & kickback.
+TraderRewardsLocker,pause,Owner (DAO/Guardian),48 (0 if Guardian),only when not paused,Freezes claims/funding.
+TraderRewardsLocker,unpause,Owner (DAO),48,only when paused,Resume after review.
+TraderRewardsLocker,emergencyWithdraw,Owner (DAO),48,any token; use care,Emergency sweep.
+RewardDripperEscrow,setFarm,Owner (DAO),48,nonzero; resets allowance if pull-enabled,Recipient for drips.
+RewardDripperEscrow,setRatePerSec,Owner (DAO),48,accrues-to-now first,Immediate rate change.
+RewardDripperEscrow,setWeeklyAmount,Owner (DAO),48,ceil(tokensPerWeek/604800),Convenience for rate/second.
+RewardDripperEscrow,scheduleRate,Owner (DAO),48,start>=now; strictly increasing,Queues future rate.
+RewardDripperEscrow,scheduleRateAfter,Owner (DAO),48,delay>=0,Queues future rate (now+delay).
+RewardDripperEscrow,clearSchedule,Owner (DAO),48,only clears future items,No effect on accrued/currentRate.
+RewardDripperEscrow,setMaxDripPerTx,Owner (DAO),48,newMax>0,Per-tx cap.
+RewardDripperEscrow,setFarmPullEnabled,Owner (DAO),48,updates allowances (old->0, new->max),Switch pull/push model.
+RewardDripperEscrow,fund,Owner (DAO/Treasury),0,amount>0; pulls XPGN from owner,Top-up escrow balance.
+RewardDripperEscrow,drip,Public/keeper,0,sends min(accrued,balance,maxDripPerTx),Permissionless top-up to farm.

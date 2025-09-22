@@ -1,0 +1,39 @@
+cat > .gitignore <<'EOF'
+# Node / pnpm
+node_modules/
+pnpm-lock.yaml.*
+.pnpm-store/
+.npm/
+# Hardhat
+artifacts/
+cache/
+coverage/
+coverage.json
+typechain-types/
+# Env & local
+.env
+.env.*
+!.env.example
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# OpenZeppelin upgrades (if any)
+.openzeppelin/
+# Reports / builds
+reports/
+dist/
+# Secrets/keys/backups
+*.key
+*.pem
+*.p12
+*.pw
+*.bak
+EOF
+
+# prettier diffs for Solidity (optional but nice)
+cat > .gitattributes <<'EOF'
+*.sol diff=solidity
+EOF
+git config diff.solidity.xfuncname "^\\s*(function|constructor|event|error|struct|enum|library)\\s+.*$"
