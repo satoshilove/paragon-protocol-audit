@@ -17,6 +17,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
 interface IParagonRouterV2Like {
     function swapExactTokensForTokensSupportingFeeOnTransferTokens(
@@ -34,7 +35,7 @@ interface IERC4626Like {
     function deposit(uint256 assets, address receiver) external returns (uint256); // mints stXPGN shares
 }
 
-contract ParagonLockerCollector is Ownable, ReentrancyGuard {
+contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     IParagonRouterV2Like public router;
@@ -54,11 +55,22 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard {
     event ReceiverSet(address indexed receiver);
     event RouterSet(address indexed router);
     event VaultSet(address indexed vault);
+    event Swept(address indexed token, address indexed to, uint256 amount);
+    event NativeSwept(address indexed to, uint256 amount);
 
     error PathInvalid();
     error PathTooLong();
     error TokenNotAllowed();
     error NothingToHarvest();
+
+    // --- Pause guardian (pause-only) ---
+    event GuardianSet(address indexed guardian);
+    address public guardian;
+
+    modifier onlyOwnerOrGuardian() {
+        require(msg.sender == owner() || msg.sender == guardian, "not owner/guardian");
+        _;
+    }
 
     constructor(address _router, address _stxpgnVault, address _receiver, address initialOwner) Ownable(initialOwner) {
         require(_router != address(0) && _stxpgnVault != address(0) && _receiver != address(0), "zero");
@@ -72,6 +84,19 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard {
     }
 
     // -------- Admin --------
+    function setGuardian(address g) external onlyOwner {
+        guardian = g;
+        emit GuardianSet(g);
+    }
+
+    function pause(string calldata /*reason*/) external onlyOwnerOrGuardian {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
     function setReceiver(address _receiver) external onlyOwner {
         require(_receiver != address(0), "zero");
         receiver = _receiver;
@@ -109,7 +134,7 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard {
         address tokenIn,
         uint256 minXPGNOut,
         address[] calldata path
-    ) external nonReentrant {
+    ) external nonReentrant whenNotPaused {
         _harvest(tokenIn, minXPGNOut, path);
     }
 
@@ -118,7 +143,7 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard {
         address[] calldata tokens,
         uint256[] calldata minOuts,
         address[][] calldata paths
-    ) external nonReentrant {
+    ) external nonReentrant whenNotPaused {
         uint256 n = tokens.length;
         require(minOuts.length == n && paths.length == n, "len");
         for (uint i; i < n; i++) {
@@ -145,7 +170,8 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard {
         }
 
         // For swaps, require a valid path tokenIn -> ... -> XPGN
-        if (path.length < 2 || path.length > MAX_PATH_LEN) revert PathTooLong();
+        if (path.length < 2) revert PathInvalid();
+        if (path.length > MAX_PATH_LEN) revert PathTooLong();
         if (path[0] != tokenIn || path[path.length - 1] != XPGN) revert PathInvalid();
 
         _approveMax(IERC20(tokenIn), address(router), amountIn);
@@ -175,7 +201,6 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard {
     function _approveMax(IERC20 t, address spender, uint256 needed) internal {
         uint256 cur = t.allowance(address(this), spender);
         if (cur < needed) {
-            // Use library-style call to avoid interface method resolution issues
             SafeERC20.forceApprove(t, spender, 0);
             SafeERC20.forceApprove(t, spender, type(uint256).max);
         }
@@ -185,7 +210,21 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard {
     function sweep(address token, address to) external onlyOwner {
         require(to != address(0), "to=0");
         uint256 bal = IERC20(token).balanceOf(address(this));
-        if (bal > 0) IERC20(token).safeTransfer(to, bal);
+        if (bal > 0) {
+            IERC20(token).safeTransfer(to, bal);
+        }
+        emit Swept(token, to, bal); // Always emit (bal may be 0)
+    }
+
+    // Updated: Use call for ETH sweep (future-proof against gas changes)
+    function withdrawNative(address to) external onlyOwner {
+        require(to != address(0), "to=0");
+        uint256 bal = address(this).balance;
+        if (bal > 0) {
+            (bool ok, ) = to.call{value: bal}("");
+            require(ok, "ETH transfer failed");
+        }
+        emit NativeSwept(to, bal); // Always emit (bal may be 0)
     }
 
     receive() external payable {}

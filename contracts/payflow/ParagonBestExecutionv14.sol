@@ -40,6 +40,7 @@ contract ParagonBestExecutionV14 is Ownable {
     }
 
     mapping(address => uint256) public nonces;
+    mapping(address => bool) public authorizedExecutors;
 
     event BestExecution(
         address indexed user,
@@ -52,6 +53,7 @@ contract ParagonBestExecutionV14 is Ownable {
         uint256 nonce
     );
     event IntentCanceled(address indexed user, uint256 nonce);
+    event ExecutorSet(address indexed executor, bool authorized);
 
     constructor(address initialOwner) Ownable(initialOwner) {
         uint256 chainId; assembly { chainId := chainid() }
@@ -64,6 +66,13 @@ contract ParagonBestExecutionV14 is Ownable {
                 address(this)
             )
         );
+    }
+
+    // ---------- Authorized Executors Management ----------
+    function setAuthorizedExecutor(address executor, bool authorized) external onlyOwner {
+        require(executor != address(0), "executor=0");
+        authorizedExecutors[executor] = authorized;
+        emit ExecutorSet(executor, authorized);
     }
 
     // ---------- hashing ----------
@@ -125,6 +134,7 @@ contract ParagonBestExecutionV14 is Ownable {
     }
 
     function consume(SwapIntent calldata it, bytes calldata sig) external {
+        require(authorizedExecutors[msg.sender], "Unauthorized executor");
         require(block.timestamp <= it.deadline, "intent: expired");
         require(it.nonce == nonces[it.user], "intent: bad nonce");
         require(it.user != address(0) && it.tokenIn != address(0) && it.tokenOut != address(0) && it.recipient != address(0), "intent: zero");
