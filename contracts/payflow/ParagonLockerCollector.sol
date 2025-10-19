@@ -2,15 +2,18 @@
 pragma solidity ^0.8.25;
 
 /**
- * Paragon Locker Collector
- * - Receives arbitrary tokens as the "locker share" from the Executor
- * - Swaps them to XPGN using Paragon Router
- * - Deposits XPGN into the stXPGN (ERC-4626 style) vault
- * - Sends the resulting stXPGN shares to a designated receiver (DAO / distributor)
+ * Paragon Locker Collector — Hardened for PAC-15
  *
- * Permissions:
- * - Anyone can call harvest()/harvestMany() (permissionless); slippage guarded by caller-provided minOut.
- * - Owner configures allowed tokens, receiver, and router/vault params.
+ * Remediations:
+ *  - harvest()/harvestMany() are keeper-gated (only trusted executors may trigger swaps)
+ *  - Optional pluggable price guard (IPriceGuard) enforces a market-consistent minimum
+ *  - Optional strictDirectPathOnly blocks multi-hop attacker paths
+ *  - Optional maxSwapPerTx reduces blast radius via chunking
+ *
+ * Compatibility notes:
+ *  - Constructor mirrors previous signature (Ownable(initialOwner)) to remain compatible with your codebase
+ *  - Router and ERC4626 vault interfaces unchanged
+ *  - Events preserved; new events & setters added for governance visibility
  */
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -28,6 +31,16 @@ interface IParagonRouterV2Like {
         uint deadline,
         uint8 autoYieldPercent
     ) external;
+}
+
+/**
+ * Optional pluggable price guard interface.
+ * Example implementation could use Chainlink USD feeds or a TWAP-based quoting contract.
+ */
+interface IPriceGuard {
+    /// @notice Quote how many XPGN would be expected for `amountIn` of `tokenIn`
+    /// @dev returns amount of XPGN (in XPGN token decimals)
+    function quoteXPGNOut(address tokenIn, uint256 amountIn) external view returns (uint256);
 }
 
 interface IERC4626Like {
@@ -48,6 +61,16 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
     uint8  public constant MAX_PATH_LEN = 5;
     uint32 public constant DEFAULT_DEADLINE_SECS = 600; // 10 minutes
 
+    // --- Keeper gating ---
+    mapping(address => bool) public keeper;
+    event KeeperSet(address indexed account, bool allowed);
+
+    // --- Optional defense-in-depth ---
+    IPriceGuard public priceGuard;                 // optional, address(0) = disabled
+    uint16      public maxSlippageBips = 1000;     // default 10% (in bips, 1 bps = 0.01%)
+    uint256     public maxSwapPerTx;               // 0 => no cap
+    bool        public strictDirectPathOnly = false;
+
     mapping(address => bool) public allowedToken; // tokens accepted from the executor
 
     event Harvested(address indexed tokenIn, uint256 amountIn, uint256 xpgnOut, uint256 stxpgnShares);
@@ -58,10 +81,16 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
     event Swept(address indexed token, address indexed to, uint256 amount);
     event NativeSwept(address indexed to, uint256 amount);
 
+    event PriceGuardSet(address indexed guard);
+    event MaxSlippageSet(uint16 bips);
+    event MaxSwapPerTxSet(uint256 amount);
+    event StrictDirectPathOnlySet(bool enabled);
+
     error PathInvalid();
     error PathTooLong();
     error TokenNotAllowed();
     error NothingToHarvest();
+    error NotKeeper();
 
     // --- Pause guardian (pause-only) ---
     event GuardianSet(address indexed guardian);
@@ -72,6 +101,12 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
         _;
     }
 
+    modifier onlyKeeper() {
+        if (!keeper[msg.sender]) revert NotKeeper();
+        _;
+    }
+
+    /// @notice Constructor kept compatible with existing codebase (Ownable(initialOwner) used previously)
     constructor(address _router, address _stxpgnVault, address _receiver, address initialOwner) Ownable(initialOwner) {
         require(_router != address(0) && _stxpgnVault != address(0) && _receiver != address(0), "zero");
         router      = IParagonRouterV2Like(_router);
@@ -129,21 +164,49 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
         }
     }
 
-    // -------- External entrypoints (nonReentrant) --------
+    // --- Keeper / guards config ---
+    function setKeeper(address account, bool allowed) external onlyOwner {
+        keeper[account] = allowed;
+        emit KeeperSet(account, allowed);
+    }
+
+    function setPriceGuard(address guard) external onlyOwner {
+        priceGuard = IPriceGuard(guard);
+        emit PriceGuardSet(guard);
+    }
+
+    function setMaxSlippageBips(uint16 bips) external onlyOwner {
+        require(bips <= 5000, "too high"); // cap to 50%
+        maxSlippageBips = bips;
+        emit MaxSlippageSet(bips);
+    }
+
+    function setMaxSwapPerTx(uint256 amount) external onlyOwner {
+        maxSwapPerTx = amount;
+        emit MaxSwapPerTxSet(amount);
+    }
+
+    function setStrictDirectPathOnly(bool enabled) external onlyOwner {
+        strictDirectPathOnly = enabled;
+        emit StrictDirectPathOnlySet(enabled);
+    }
+
+    // -------- External entrypoints (nonReentrant, now keeper-gated) --------
+    /// @notice Only keeper addresses (set via setKeeper) may call harvest
     function harvest(
         address tokenIn,
         uint256 minXPGNOut,
         address[] calldata path
-    ) external nonReentrant whenNotPaused {
+    ) external nonReentrant whenNotPaused onlyKeeper {
         _harvest(tokenIn, minXPGNOut, path);
     }
 
-    // Batch: processes multiple tokens in a single tx without reentering
+    /// @notice Batch harvesting — keeper-only
     function harvestMany(
         address[] calldata tokens,
         uint256[] calldata minOuts,
         address[][] calldata paths
-    ) external nonReentrant whenNotPaused {
+    ) external nonReentrant whenNotPaused onlyKeeper {
         uint256 n = tokens.length;
         require(minOuts.length == n && paths.length == n, "len");
         for (uint i; i < n; i++) {
@@ -159,27 +222,35 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
     ) internal {
         if (!allowedToken[tokenIn]) revert TokenNotAllowed();
 
-        uint256 amountIn = IERC20(tokenIn).balanceOf(address(this));
-        if (amountIn == 0) revert NothingToHarvest();
+        uint256 bal = IERC20(tokenIn).balanceOf(address(this));
+        if (bal == 0) revert NothingToHarvest();
+
+        uint256 amountIn = bal;
+        if (maxSwapPerTx != 0 && amountIn > maxSwapPerTx) {
+            amountIn = maxSwapPerTx;
+        }
 
         if (tokenIn == XPGN) {
-            // No swap; deposit directly
+            // No swap needed — deposit directly
             uint256 shares = _depositToVault(amountIn);
             emit Harvested(tokenIn, amountIn, amountIn, shares);
             return;
         }
 
-        // For swaps, require a valid path tokenIn -> ... -> XPGN
+        // Path validation
         if (path.length < 2) revert PathInvalid();
         if (path.length > MAX_PATH_LEN) revert PathTooLong();
         if (path[0] != tokenIn || path[path.length - 1] != XPGN) revert PathInvalid();
+        if (strictDirectPathOnly) {
+            if (path.length != 2 || path[1] != XPGN) revert PathInvalid();
+        }
 
         _approveMax(IERC20(tokenIn), address(router), amountIn);
 
         uint256 xBefore = IERC20(XPGN).balanceOf(address(this));
         router.swapExactTokensForTokensSupportingFeeOnTransferTokens(
             amountIn,
-            minXPGNOut,
+            minXPGNOut, // still honored as a caller-provided guard (keeper supplies this)
             path,
             address(this),
             block.timestamp + DEFAULT_DEADLINE_SECS,
@@ -187,6 +258,16 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
         );
         uint256 xAfter = IERC20(XPGN).balanceOf(address(this));
         uint256 xGot   = xAfter - xBefore;
+
+        // --- Oracle sanity check (optional) ---
+        if (address(priceGuard) != address(0)) {
+            uint256 fair = priceGuard.quoteXPGNOut(tokenIn, amountIn);
+            // require xGot >= fair * (1 - maxSlippageBips)
+            uint256 minFair = (fair * (10_000 - maxSlippageBips)) / 10_000;
+            require(xGot >= minFair, "priceGuard: too little out");
+        }
+
+        // Keep original minOut check (extra guard)
         require(xGot >= minXPGNOut, "minOut");
 
         uint256 sharesMinted = _depositToVault(xGot);
@@ -213,10 +294,9 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
         if (bal > 0) {
             IERC20(token).safeTransfer(to, bal);
         }
-        emit Swept(token, to, bal); // Always emit (bal may be 0)
+        emit Swept(token, to, bal);
     }
 
-    // Updated: Use call for ETH sweep (future-proof against gas changes)
     function withdrawNative(address to) external onlyOwner {
         require(to != address(0), "to=0");
         uint256 bal = address(this).balance;
@@ -224,7 +304,7 @@ contract ParagonLockerCollector is Ownable, ReentrancyGuard, Pausable {
             (bool ok, ) = to.call{value: bal}("");
             require(ok, "ETH transfer failed");
         }
-        emit NativeSwept(to, bal); // Always emit (bal may be 0)
+        emit NativeSwept(to, bal);
     }
 
     receive() external payable {}
