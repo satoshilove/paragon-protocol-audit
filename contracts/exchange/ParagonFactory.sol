@@ -48,13 +48,14 @@ contract ParagonFactory is IParagonFactory, Ownable, Pausable, ReentrancyGuard {
 
     // ─────────────────────── Dynamic-fee additions ───────────────────────
 
-    /// Per-pair fee override in bips. 0 => use global swapFeeBips
+    /// Per-pair fee override in bips.
+    /// 0 => use global swapFeeBips (no dynamic re-application)
     mapping(address => uint32) public pairSwapFeeBips;
 
     /// Base/core tokens (e.g., WBNB, USDT, XPGN). Configured by owner.
     mapping(address => bool) public baseToken;
 
-    /// Specific allowlisted pairs (sorted token order). If true → use global default.
+    /// Specific allowlisted pairs (sorted token order). If true → use global default at creation-time.
     mapping(bytes32 => bool) public allowlistedPair;
 
     /// Default policy for non-core pairs created by anyone:
@@ -105,8 +106,14 @@ contract ParagonFactory is IParagonFactory, Ownable, Pausable, ReentrancyGuard {
         return keccak256(abi.encodePacked(t0, t1));
     }
 
-    // View: what fee would we assign by policy if this pair were created now?
-    function calculateInitialPairFeeBips(address tokenA, address tokenB) public view returns (uint32 bips, uint8 category) {
+    /// @notice View helper: what fee would be auto-assigned if this pair was created now?
+    /// @dev Used only at creation time; once stored in pairSwapFeeBips, we *do not* re-apply policy dynamically.
+    function calculateInitialPairFeeBips(address tokenA, address tokenB)
+        public
+        view
+        override
+        returns (uint32 bips, uint8 category)
+    {
         bytes32 key = _pairKey(tokenA, tokenB);
 
         // 0) explicit allowlist → use global default
@@ -162,10 +169,10 @@ contract ParagonFactory is IParagonFactory, Ownable, Pausable, ReentrancyGuard {
         isPair[pair] = true;
         allPairs.push(pair);
 
-        // Apply initial dynamic fee policy
+        // Apply initial dynamic fee policy (one-time)
         (uint32 initBips, uint8 category) = calculateInitialPairFeeBips(token0, token1);
         if (initBips > 0) {
-            // store per-pair override (0 means "use global")
+            // store per-pair override (0 means "use global swapFeeBips")
             pairSwapFeeBips[pair] = initBips;
             emit PairSwapFeeUpdated(pair, initBips);
         }
@@ -183,38 +190,33 @@ contract ParagonFactory is IParagonFactory, Ownable, Pausable, ReentrancyGuard {
         emit SwapFeeUpdated(_swapFeeBips);
     }
 
-    /// Set or clear a per-pair override. 0 => use global default.
+    /// Set or clear a per-pair override. 0 => use global default (no dynamic policy).
     function setPairSwapFee(address pair, uint32 bips) external onlyFeeToSetter {
         require(isPair[pair], "Paragon: NOT_PAIR");
         require(bips <= MAX_FEE_BIPS, "Paragon: FEE_TOO_HIGH");
-        pairSwapFeeBips[pair] = bips; // 0 allowed
+        pairSwapFeeBips[pair] = bips; // 0 allowed → use global
         emit PairSwapFeeUpdated(pair, bips);
     }
 
     /// Effective fee the Pair/Library should use for a given pair.
-    function getEffectiveSwapFeeBips(address pair) external view returns (uint32) {
+    /// - If override is non-zero, that exact value is used.
+    /// - If override is zero, pair uses the global swapFeeBips.
+    function getEffectiveSwapFeeBips(address pair) external view override returns (uint32) {
         uint32 b = pairSwapFeeBips[pair];
-        if (b != 0) return b; // explicit override takes priority
-
-        // Dynamic policy fallback (no override): compute from tokens + allowlist
-        address t0 = IParagonPair(pair).token0();
-        address t1 = IParagonPair(pair).token1();
-        bytes32 key = keccak256(abi.encodePacked(t0, t1));
-
-        // allowlisted or both base → global default
-        if (allowlistedPair[key] || (baseToken[t0] && baseToken[t1])) {
-            return swapFeeBips;
+        if (b != 0) {
+            return b; // explicit override takes priority
         }
-        // exactly one base → mid/high default
-        if (baseToken[t0] || baseToken[t1]) {
-            return nonBaseWithBaseFeeBips;
-        }
-        // neither base → highest default
-        return nonBaseFeeBips;
+        // 0 => always use global default; we deliberately do NOT re-apply dynamic policy here.
+        return swapFeeBips;
     }
 
     /// Update default policy for automatically assigned higher fees on new pairs.
-    function setDefaultNonBaseFees(uint32 _nonBaseWithBaseFeeBips, uint32 _nonBaseFeeBips) external onlyFeeToSetter {
+    /// Only affects future `createPair` calls; does not retroactively adjust existing pairs.
+    function setDefaultNonBaseFees(uint32 _nonBaseWithBaseFeeBips, uint32 _nonBaseFeeBips)
+        external
+        override
+        onlyFeeToSetter
+    {
         require(_nonBaseWithBaseFeeBips <= MAX_FEE_BIPS, "Paragon: FEE_TOO_HIGH");
         require(_nonBaseFeeBips        <= MAX_FEE_BIPS, "Paragon: FEE_TOO_HIGH");
         nonBaseWithBaseFeeBips = _nonBaseWithBaseFeeBips;
@@ -223,13 +225,13 @@ contract ParagonFactory is IParagonFactory, Ownable, Pausable, ReentrancyGuard {
     }
 
     /// Mark/unmark a token as base/core (e.g., WBNB, USDT, XPGN)
-    function setBaseToken(address token, bool isBase) external onlyOwner {
+    function setBaseToken(address token, bool isBase) external override onlyOwner {
         require(token != address(0), "Paragon: ZERO_ADDRESS");
         baseToken[token] = isBase;
         emit BaseTokenUpdated(token, isBase);
     }
 
-    function setBaseTokens(address[] calldata tokens, bool[] calldata flags) external onlyOwner {
+    function setBaseTokens(address[] calldata tokens, bool[] calldata flags) external override onlyOwner {
         require(tokens.length == flags.length, "Paragon: LEN_MISMATCH");
         for (uint i = 0; i < tokens.length; i++) {
             address t = tokens[i];
@@ -239,17 +241,17 @@ contract ParagonFactory is IParagonFactory, Ownable, Pausable, ReentrancyGuard {
         }
     }
 
-    /// Allowlist a specific pair (by tokens) to always use global default
-    function setPairAllowlist(address tokenA, address tokenB, bool allowed) external onlyOwner {
+    /// Allowlist a specific pair (by tokens) to always use global default at creation.
+    function setPairAllowlist(address tokenA, address tokenB, bool allowed) external override onlyOwner {
         bytes32 key = _pairKey(tokenA, tokenB);
         allowlistedPair[key] = allowed;
         (address t0, address t1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
         emit PairAllowlistUpdated(t0, t1, allowed);
     }
 
-    function clearPairSwapFee(address pair) external onlyFeeToSetter {
+    function clearPairSwapFee(address pair) external override onlyFeeToSetter {
         require(isPair[pair], "Paragon: NOT_PAIR");
-        pairSwapFeeBips[pair] = 0;
+        pairSwapFeeBips[pair] = 0; // back to global swapFeeBips
         emit PairSwapFeeUpdated(pair, 0);
     }
 
@@ -267,7 +269,7 @@ contract ParagonFactory is IParagonFactory, Ownable, Pausable, ReentrancyGuard {
     }
 
     /// Owner can update the XPGN token (used by Library for pause guard)
-    function setXPGNToken(address _xpgnToken) external onlyOwner {
+    function setXPGNToken(address _xpgnToken) external override onlyOwner {
         xpgnToken = _xpgnToken;
         emit XPGNTokenUpdated(_xpgnToken);
     }

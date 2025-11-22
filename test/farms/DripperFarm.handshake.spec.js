@@ -33,8 +33,7 @@ async function deployFixture() {
     currentBlock + 1
   );
 
-  // addPool(uint256 allocPoint, IERC20 lpToken, uint256 harvestDelay) or similar
-  // Your controller uses addPool(..) in latest sources.
+  // addPool(uint256 allocPoint, IERC20 lpToken, uint256 harvestDelay)
   await (await farm.addPool(1000, lp.target, 0)).wait();
 
   // --- Dripper ---
@@ -57,13 +56,15 @@ async function deployFixture() {
   await reward.transfer(await dripper.getAddress(), ethers.parseEther("1000"));
 
   // --- Wire farm <-> dripper and parameters ---
-  await (await farm.setDripper(await dripper.getAddress())).wait();
-
-  // Configure small thresholds so test runs quickly
-  // setDripCooldownSecs(uint32 secs), setMinDripAmount(uint256), setLowWaterDays(uint8)
-  if (farm.setDripCooldownSecs) await (await farm.setDripCooldownSecs(0)).wait();
-  if (farm.setMinDripAmount) await (await farm.setMinDripAmount(ethers.parseEther("1"))).wait();
-  if (farm.setLowWaterDays) await (await farm.setLowWaterDays(1)).wait();
+  // setDripperConfig(address _dripper, uint256 _days, uint64 _cooldown, uint256 _min)
+  await (
+    await farm.setDripperConfig(
+      await dripper.getAddress(),
+      1,                            // lowWaterDays (1 day runway)
+      0,                            // dripCooldownSecs (no cooldown in tests)
+      ethers.parseEther("1")        // minDripAmount
+    )
+  ).wait();
 
   return { deployer, user, reward, lp, farm, dripper };
 }

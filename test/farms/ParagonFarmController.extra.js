@@ -4,10 +4,19 @@ const hre = require("hardhat");
 const { ethers } = hre;
 const { loadFixture, time } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
 
+/**
+ * Generic deploy helper that guesses constructor args based on param names.
+ * For ParagonFarmController this will resolve:
+ *  - initialOwner  → ctx.owner.address
+ *  - _rewardToken  → ctx.reward.target
+ *  - other address → ZeroAddress
+ *  - uint/bool     → 0 / false
+ */
 async function deployAdaptive(name, ctx = {}) {
   const F = await ethers.getContractFactory(name);
   const art = await hre.artifacts.readArtifact(name);
   const ctor = (art.abi.find(x => x.type === "constructor") || { inputs: [] }).inputs;
+
   const map = (name) => {
     const n = (name || "").toLowerCase();
     if (n.includes("owner") || n.includes("admin")) return ctx.owner?.address ?? ctx.user?.address;
@@ -15,15 +24,31 @@ async function deployAdaptive(name, ctx = {}) {
     if (n.includes("treasury") || n.includes("dao")) return ctx.dao?.address ?? ethers.ZeroAddress;
     return ethers.ZeroAddress;
   };
-  const args = ctor.map(i => i.type.startsWith("address") ? map(i.name) : (i.type === "bool" ? false : 0));
+
+  const args = ctor.map((i) =>
+    i.type.startsWith("address")
+      ? map(i.name)
+      : i.type === "bool"
+      ? false
+      : 0
+  );
+
   const c = await F.deploy(...args);
   await c.waitForDeployment();
   return c;
 }
 
+/**
+ * Generic addPool helper that adapts to different addPool signatures.
+ * For ParagonFarmController (allocPoint, lpToken, harvestDelay) it will call:
+ *   addPool(100, lpToken, 0)
+ */
 async function addPoolAdaptive(farm, lpToken) {
-  const overloads = farm.interface.fragments.filter(f => f.type === "function" && f.name === "addPool");
+  const overloads = farm.interface.fragments.filter(
+    (f) => f.type === "function" && f.name === "addPool"
+  );
   if (overloads.length === 0) return; // nothing to do
+
   const f = overloads[0];
   const args = f.inputs.map((inp) => {
     const n = (inp.name || "").toLowerCase();
@@ -32,15 +57,18 @@ async function addPoolAdaptive(farm, lpToken) {
     if (inp.type === "bool") return true;
     return 0;
   });
+
   await (await farm.addPool(...args)).wait();
 }
 
 async function deployFarmFixture() {
   const [owner] = await ethers.getSigners();
+
   const ERC = await ethers.getContractFactory("contracts/mocks/MockERC20.sol:MockERC20");
   const reward = await ERC.deploy("RWD", "RWD", 18);
-  const lp     = await ERC.deploy("LP", "LP", 18);
-  await reward.waitForDeployment(); await lp.waitForDeployment();
+  const lp = await ERC.deploy("LP", "LP", 18);
+  await reward.waitForDeployment();
+  await lp.waitForDeployment();
 
   const farm = await deployAdaptive("ParagonFarmController", { owner, reward });
   await addPoolAdaptive(farm, lp);
@@ -58,8 +86,12 @@ describe("ParagonFarmController - Additional Security Tests", function () {
 
   it("INV-FARM-ATTACK-01: Alloc batch changes don't retroactively affect past accruals", async function () {
     const { farm } = await loadFixture(deployFarmFixture);
-    const f = farm.interface.fragments.find(x => x.type === "function" && x.name === "setAllocPointsBatch");
+
+    const f = farm.interface.fragments.find(
+      (x) => x.type === "function" && x.name === "setAllocPointsBatch"
+    );
     if (!f) return this.skip?.();
+
     const args = f.inputs.map((inp, i) => {
       if (inp.type.endsWith("[]")) {
         // ids / allocs
@@ -67,6 +99,7 @@ describe("ParagonFarmController - Additional Security Tests", function () {
       }
       return 0;
     });
+
     await expect(farm.setAllocPointsBatch(...args)).to.not.be.reverted;
     await time.increase(60);
     await expect(farm.updatePool(0)).to.not.be.reverted;

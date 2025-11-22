@@ -7,11 +7,8 @@ interface IParagonRouter {
     function WNative() external view returns (address);
 
     // -------- Auto-yield config --------
-    /// @notice Pool ID that receives auto-yield deposits
     function autoYieldPid() external view returns (uint256);
-    /// @notice Global toggle for auto-yield deposits
     function autoYieldEnabled() external view returns (bool);
-    /// @notice Owner can change the auto-yield pool and enable/disable globally
     function setAutoYieldConfig(uint256 pid, bool enabled) external;
 
     // -------- Events (single source of truth) --------

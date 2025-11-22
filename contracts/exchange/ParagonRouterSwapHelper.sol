@@ -54,7 +54,7 @@ library ParagonRouterSwapHelper {
                     input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
 
                 uint256 balIn = IERC20(input).balanceOf(pairAddr);
-                require(balIn > reserveIn, "FOT_INSUFF_INPUT"); // clarity guard
+                require(balIn > reserveIn, "FOT_INSUFF_INPUT");
                 uint256 amountIn = balIn - reserveIn;
 
                 uint32 feeBips = IParagonFactory(factory_).getEffectiveSwapFeeBips(pairAddr);

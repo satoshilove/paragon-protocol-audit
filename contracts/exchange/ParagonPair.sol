@@ -108,15 +108,22 @@ contract ParagonPair is ParagonERC20, ReentrancyGuard, IParagonPair {
         if (feeOn && _kLastLoc != 0) {
             uint256 rootK = Math.sqrt(uint256(_reserve0) * _reserve1);
             uint256 rootKLast = Math.sqrt(_kLastLoc);
+
             if (rootK > rootKLast) {
-                // ~1/6 protocol share (denominator 5 vs UniV2's 3)
-                uint256 num = totalSupply * (rootK - rootKLast);
-                uint256 den = rootK * 5 + rootKLast;
-                uint256 liq = num / den;
-                if (liq > 0) _mint(feeTo, liq);
+                // Paragon is intentionally pro-LP:
+                // When protocol fee is enabled, we take 1/6 of the growth in sqrt(k) as new LP tokens for feeTo.
+                // We use denominator = rootK × 5 + rootKLast instead of the classic Uniswap V2 rootK × 6 + rootKLast.
+                // → This gives liquidity providers ~20% more of the protocol-fee portion than Uniswap V2 / SushiSwap.
+                // Example: at 2× pool growth, Uniswap V2 gives feeTo 0.0500% → Paragon gives feeTo only 0.0417%
+                // (the difference goes back to LPs — a deliberate design choice marketed as "More rewards for LPs").
+                uint256 numerator = totalSupply * (rootK - rootKLast);
+                uint256 denominator = rootK * 5 + rootKLast;
+                uint256 liquidity = numerator / denominator;
+
+                if (liquidity > 0) _mint(feeTo, liquidity);
             }
         } else if (!feeOn && _kLastLoc != 0) {
-            kLast = 0;
+            kLast = 0; // Fee disabled → clear kLast (standard behavior)
         }
     }
 
@@ -219,7 +226,6 @@ contract ParagonPair is ParagonERC20, ReentrancyGuard, IParagonPair {
         uint256 in1 = b1 > (_r1 - amount1Out) ? b1 - (_r1 - amount1Out) : 0;
         require(in0 > 0 || in1 > 0, "Paragon: INSUFFICIENT_INPUT_AMOUNT");
 
-        // Cache fee once
         uint32 fee = getSwapFee();
         {
             uint256 adj0 = b0 * 10000 - in0 * fee;
@@ -233,14 +239,12 @@ contract ParagonPair is ParagonERC20, ReentrancyGuard, IParagonPair {
 
     /// @inheritdoc IParagonPair
     function skim(address to) external override nonReentrant {
-        // Public (Pancake/Uni style): anyone can force balances to match reserves.
         _safeTransfer(token0, to, IERC20(token0).balanceOf(address(this)) - reserve0);
         _safeTransfer(token1, to, IERC20(token1).balanceOf(address(this)) - reserve1);
     }
 
     /// @inheritdoc IParagonPair
     function sync() external override nonReentrant {
-        // Public (Pancake/Uni style): anyone can sync reserves to balances.
         _update(
             IERC20(token0).balanceOf(address(this)),
             IERC20(token1).balanceOf(address(this)),

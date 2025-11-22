@@ -3,23 +3,13 @@ pragma solidity ^0.8.13;
 
 /**
  * @title Multicall3
- * @author (based on mudgen's Multicall3)
- * @notice Aggregate multiple read/write calls and optionally forward ETH.
- *         Includes helpers for block metadata and chain/basefee info.
- *
- * Interfaces covered:
- *  - aggregate(Call[])
- *  - tryAggregate(bool, Call[])
- *  - blockAndAggregate(Call[])
- *  - tryBlockAndAggregate(bool, Call[])
- *  - aggregate3(Call3[])
- *  - aggregate3Value(Call3Value[])
- *  - helpers: getBlockHash, getLastBlockHash, getCurrentBlock*(), getBasefee, getChainId, getEthBalance
+ * @notice Canonical-style Multicall3: batch calls (read/write) with optional ETH forwarding,
+ *         per-call allowFailure, and helper view functions for block / chain metadata.
  */
 contract Multicall3 {
-    /*//////////////////////////////////////////////////////////////
-                                 TYPES
-    //////////////////////////////////////////////////////////////*/
+    /*//////////////////////////////////////////////////////////////////////////
+                                     TYPES
+    //////////////////////////////////////////////////////////////////////////*/
 
     struct Call {
         address target;
@@ -44,20 +34,39 @@ contract Multicall3 {
         bytes returnData;
     }
 
-    /*//////////////////////////////////////////////////////////////
-                               RECEIVE
-    //////////////////////////////////////////////////////////////*/
+    /*//////////////////////////////////////////////////////////////////////////
+                                ERRORS & EVENTS
+    //////////////////////////////////////////////////////////////////////////*/
+
+    error CallFailed();
+    error ValueMismatch();
+    error ReentrancyLock();
+
+    // Events renamed to avoid clashes with struct identifiers
+    event Call3Executed(address indexed target, bool success, bytes returnData);
+    event Call3ValueExecuted(address indexed target, bool success, uint256 value, bytes returnData);
+
+    // Simple non-reentrancy guard for value-sending aggregate3Value
+    uint256 private locked = 1; // 1 = not entered, 2 = entered
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                   RECEIVE
+    //////////////////////////////////////////////////////////////////////////*/
 
     // Needed to receive ETH for aggregate3Value calls
     receive() external payable {}
 
-    /*//////////////////////////////////////////////////////////////
-                               AGGREGATE
-    //////////////////////////////////////////////////////////////*/
+    modifier nonReentrant() {
+        if (locked == 2) revert ReentrancyLock();
+        locked = 2;
+        _;
+        locked = 1;
+    }
 
-    /// @notice Executes a batch of calls, all must succeed.
-    /// @return blockNumber Current block number.
-    /// @return returnData Return data for each call in order.
+    /*//////////////////////////////////////////////////////////////////////////
+                              LEGACY MULTICALL2
+    //////////////////////////////////////////////////////////////////////////*/
+
     function aggregate(Call[] calldata calls)
         external
         payable
@@ -67,17 +76,15 @@ contract Multicall3 {
         uint256 length = calls.length;
         returnData = new bytes[](length);
 
-        for (uint256 i = 0; i < length; ) {
-            (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
-            require(success, "Multicall3: call failed");
-            returnData[i] = ret;
-            unchecked { ++i; }
+        unchecked {
+            for (uint256 i = 0; i < length; ++i) {
+                (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
+                if (!success) revert CallFailed();
+                returnData[i] = ret;
+            }
         }
     }
 
-    /// @notice Executes a batch of calls; optionally requires all to succeed.
-    /// @param requireSuccess If true, reverts on first failure.
-    /// @return returnData Success flag and return data per call.
     function tryAggregate(bool requireSuccess, Call[] calldata calls)
         external
         payable
@@ -86,18 +93,15 @@ contract Multicall3 {
         uint256 length = calls.length;
         returnData = new Result[](length);
 
-        for (uint256 i = 0; i < length; ) {
-            (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
-
-            if (requireSuccess) {
-                require(success, "Multicall3: call failed");
+        unchecked {
+            for (uint256 i = 0; i < length; ++i) {
+                (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
+                if (requireSuccess && !success) revert CallFailed();
+                returnData[i] = Result({ success: success, returnData: ret });
             }
-            returnData[i] = Result({ success: success, returnData: ret });
-            unchecked { ++i; }
         }
     }
 
-    /// @notice Executes a batch of calls, all must succeed, and returns block hash too.
     function blockAndAggregate(Call[] calldata calls)
         external
         payable
@@ -108,15 +112,15 @@ contract Multicall3 {
         uint256 length = calls.length;
         returnData = new Result[](length);
 
-        for (uint256 i = 0; i < length; ) {
-            (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
-            require(success, "Multicall3: call failed");
-            returnData[i] = Result({ success: success, returnData: ret });
-            unchecked { ++i; }
+        unchecked {
+            for (uint256 i = 0; i < length; ++i) {
+                (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
+                if (!success) revert CallFailed();
+                returnData[i] = Result({ success: success, returnData: ret });
+            }
         }
     }
 
-    /// @notice Executes a batch of calls; optionally requires all to succeed, and returns block hash too.
     function tryBlockAndAggregate(bool requireSuccess, Call[] calldata calls)
         external
         payable
@@ -127,21 +131,20 @@ contract Multicall3 {
         uint256 length = calls.length;
         returnData = new Result[](length);
 
-        for (uint256 i = 0; i < length; ) {
-            (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
-            if (requireSuccess) {
-                require(success, "Multicall3: call failed");
+        unchecked {
+            for (uint256 i = 0; i < length; ++i) {
+                (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
+                if (requireSuccess && !success) revert CallFailed();
+                returnData[i] = Result({ success: success, returnData: ret });
             }
-            returnData[i] = Result({ success: success, returnData: ret });
-            unchecked { ++i; }
         }
     }
 
-    /*//////////////////////////////////////////////////////////////
-                         AGGREGATE v3 (allowFailure)
-    //////////////////////////////////////////////////////////////*/
+    /*//////////////////////////////////////////////////////////////////////////
+                                AGGREGATE v3
+                      (per-call allowFailure + value support)
+    //////////////////////////////////////////////////////////////////////////*/
 
-    /// @notice Executes a batch of calls where each can opt-in to allow failure.
     function aggregate3(Call3[] calldata calls)
         external
         payable
@@ -150,66 +153,70 @@ contract Multicall3 {
         uint256 length = calls.length;
         returnData = new Result[](length);
 
-        for (uint256 i = 0; i < length; ) {
-            (bool success, bytes memory ret) = calls[i].target.call(calls[i].callData);
-            if (!calls[i].allowFailure) {
-                require(success, "Multicall3: call failed");
+        unchecked {
+            for (uint256 i = 0; i < length; ++i) {
+                Call3 calldata c = calls[i];
+                (bool success, bytes memory ret) = c.target.call(c.callData);
+
+                if (!success && !c.allowFailure) revert CallFailed();
+
+                Result memory result = Result({ success: success, returnData: ret });
+                returnData[i] = result;
+
+                emit Call3Executed(c.target, success, ret);
             }
-            returnData[i] = Result({ success: success, returnData: ret });
-            unchecked { ++i; }
         }
     }
 
-    /// @notice Executes a batch of calls with ETH value per call and per-call failure policy.
-    /// @dev Requires msg.value to exactly match the sum of values to avoid trapping ETH.
     function aggregate3Value(Call3Value[] calldata calls)
         external
         payable
+        nonReentrant
         returns (Result[] memory returnData)
     {
         uint256 length = calls.length;
         returnData = new Result[](length);
 
-        uint256 valueAccumulator = 0;
+        uint256 valueAccumulator;
 
-        for (uint256 i = 0; i < length; ) {
-            valueAccumulator += calls[i].value;
+        unchecked {
+            for (uint256 i = 0; i < length; ++i) {
+                Call3Value calldata c = calls[i];
+                valueAccumulator += c.value;
 
-            (bool success, bytes memory ret) =
-                calls[i].target.call{ value: calls[i].value }(calls[i].callData);
+                (bool success, bytes memory ret) =
+                    c.target.call{ value: c.value }(c.callData);
 
-            if (!calls[i].allowFailure) {
-                require(success, "Multicall3: call failed");
+                if (!success && !c.allowFailure) revert CallFailed();
+
+                Result memory result = Result({ success: success, returnData: ret });
+                returnData[i] = result;
+
+                emit Call3ValueExecuted(c.target, success, c.value, ret);
             }
-            returnData[i] = Result({ success: success, returnData: ret });
-            unchecked { ++i; }
         }
 
-        require(msg.value == valueAccumulator, "Multicall3: value mismatch");
+        if (msg.value != valueAccumulator) revert ValueMismatch();
     }
 
-    /*//////////////////////////////////////////////////////////////
-                            HELPER VIEW FUNCS
-    //////////////////////////////////////////////////////////////*/
+    /*//////////////////////////////////////////////////////////////////////////
+                                VIEW HELPERS
+    //////////////////////////////////////////////////////////////////////////*/
+
+    function getBlockHash(uint256 blockNumber) external view returns (bytes32) {
+        return blockhash(blockNumber);
+    }
 
     function getBlockNumber() external view returns (uint256) {
         return block.number;
     }
 
-    function getBlockHash(uint256 blockNumber_) external view returns (bytes32) {
-        return blockhash(blockNumber_);
-    }
-
-    function getLastBlockHash() external view returns (bytes32) {
-        return blockhash(block.number - 1);
-    }
-
-    function getCurrentBlockTimestamp() external view returns (uint256) {
-        return block.timestamp;
+    function getCurrentBlockCoinbase() external view returns (address) {
+        return block.coinbase;
     }
 
     function getCurrentBlockDifficulty() external view returns (uint256) {
-        // Post-merge, difficulty is repurposed; kept for compatibility.
+        // Post-merge chains repurpose difficulty as random beacon (prevrandao)
         return block.prevrandao;
     }
 
@@ -217,21 +224,25 @@ contract Multicall3 {
         return block.gaslimit;
     }
 
-    function getCurrentBlockCoinbase() external view returns (address) {
-        return block.coinbase;
+    function getCurrentBlockTimestamp() external view returns (uint256) {
+        return block.timestamp;
     }
 
-    function getChainId() external view returns (uint256 chainId) {
-        assembly {
-            chainId := chainid()
-        }
+    function getEthBalance(address addr) external view returns (uint256) {
+        return addr.balance;
+    }
+
+    function getLastBlockHash() external view returns (bytes32) {
+        return blockhash(block.number - 1);
     }
 
     function getBasefee() external view returns (uint256) {
         return block.basefee;
     }
 
-    function getEthBalance(address account) external view returns (uint256) {
-        return account.balance;
+    function getChainId() external view returns (uint256 chainId) {
+        assembly {
+            chainId := chainid()
+        }
     }
 }
