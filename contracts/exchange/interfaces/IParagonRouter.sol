@@ -127,6 +127,15 @@ interface IParagonRouter {
         uint8 autoYieldPercent
     ) external payable returns (uint[] memory amounts);
 
+    // ✅ ADDED: exact-in tokens -> native (non-FOT)
+    function swapExactTokensForNative(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
     function swapTokensForExactNative(
         uint amountOut,
         uint amountInMax,

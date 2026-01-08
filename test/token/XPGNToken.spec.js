@@ -8,7 +8,7 @@ const E18 = (n) => ethers.parseEther(n.toString());
 const BI  = (x) => (typeof x === "bigint" ? x : BigInt(x)); // normalize to BigInt
 
 // Match contract constants
-const GENESIS = E18(10_000_000);
+const GENESIS = E18(202_020);
 const FARMING_CAP   = E18(150_000_000);
 const VALIDATOR_CAP = E18(250_000_000);
 const ECOSYS_CAP    = E18(40_000_001);

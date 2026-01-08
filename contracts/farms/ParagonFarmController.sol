@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 interface IReferralManager {
     function recordReferral(address user, address referrer) external;
@@ -15,18 +16,25 @@ interface IReferralManager {
 interface IRewardDripper {
     function drip() external returns (uint256 sent);
     function pendingAccrued() external view returns (uint256);
+    function rewardToken() external view returns (address); // PAD-23
 }
 
 /**
- * @title ParagonFarmController - Final Production Release (November 2025)
+ * @title ParagonFarmController - Final Production Release (November 2025) - Audit fixes applied
  * @notice High-performance MasterChef-style farm with full safety when rewardToken is used as LP token
- * @dev Uses per-pool tracking + cached global staked amount → zero risk of principal leakage
- *      Battle-tested pattern used by top farms in 2025
+ * @dev Design choice: LP tokens must be standard ERC20 (no fee-on-transfer / rebasing). This matches Pancake/Sushi
+ *      MasterChef assumptions and avoids accounting ambiguity (PAD-07).
  */
 contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
+
+    // PAD-24 FIX: support multiple authorized router-like callers (Router + Zap + future modules)
+    bytes32 public constant AUTOYIELD_CALLER_ROLE = keccak256("AUTOYIELD_CALLER_ROLE");
+
+    // PAD-10: high precision to prevent zero-accumulation when reward token decimals are small vs LP supply
+    uint256 public constant PRECISION_FACTOR = 1e30;
 
     struct UserInfo {
         uint256 amount;          // LP tokens staked
@@ -39,28 +47,29 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         IERC20 lpToken;            // LP token
         uint256 allocPoint;        // Allocation points
         uint256 lastRewardBlock;   // Last block rewards were updated
-        uint256 accRewardPerShare; // × 1e12
+        uint256 accRewardPerShare; // × PRECISION_FACTOR
         uint256 harvestDelay;      // Seconds before rewards are claimable
         uint256 totalStaked;       // Total LP staked
         uint256 rewardTokenStaked; // Only used if lpToken == rewardToken
     }
 
     IERC20 public immutable rewardToken;
-
     uint256 public rewardPerBlock;
     uint256 public totalAllocPoint;
     uint256 public startBlock;
 
     IReferralManager public referralManager;
-    address public autoYieldRouter;
+
+    // PAD-24: keep autoYieldDeposited tracking, but remove single autoYieldRouter limitation
     mapping(uint256 pid => mapping(address user => uint256)) public autoYieldDeposited;
+
     bool public emissionsPaused;
 
     IRewardDripper public dripper;
     uint256 public lowWaterDays = 3;
     uint64 public dripCooldownSecs = 900; // 15 min
     uint64 public lastDripAt;
-    uint256 public minDripAmount = 1e18;
+    uint256 public minDripAmount; // Dynamically set in constructor (PAD-20)
 
     uint16 public constant MAX_PERF_FEE_BIPS = 500; // 5.00%
     address public feeRecipient;
@@ -87,36 +96,41 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     event DripperPoked(uint256 sent, uint256 availableAfter);
     event DripperConfigUpdated(address dripper, uint256 lowWaterDays, uint64 cooldown, uint256 minDrip);
 
+    // PAD-24: explicit ops visibility
+    event AutoYieldCallerUpdated(address indexed caller, bool allowed);
+
     constructor(
         address initialOwner,
         IERC20 _rewardToken,
         uint256 _rewardPerBlock,
         uint256 _startBlock
     ) Ownable(initialOwner) {
+        require(initialOwner != address(0), "zero owner");
         require(address(_rewardToken) != address(0), "zero reward token");
+
         rewardToken = _rewardToken;
         rewardPerBlock = _rewardPerBlock;
         startBlock = _startBlock;
         feeRecipient = initialOwner;
 
-        // AccessControl setup: initialOwner is the admin of roles
+        // PAD-20: Dynamic minDripAmount ≈ 1000 full tokens (based on reward token decimals)
+        // Note: owner can override via setDripperConfig().
+        try IERC20Metadata(address(_rewardToken)).decimals() returns (uint8 dec) {
+            // dec is typically <= 18; if it's weirdly high, owner can override later.
+            minDripAmount = 1000 * (10 ** uint256(dec));
+        } catch {
+            minDripAmount = 1000 * 1e18; // fallback assuming 18 decimals
+        }
+
         _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
     }
 
     // ────────────────────────────── Guardian / Pause ──────────────────────────────
 
-    /**
-     * @notice Pause user interactions (deposit/withdraw/harvest) in emergencies.
-     * @dev Guardian-controlled; does NOT affect admin config calls.
-     */
     function pause() external onlyRole(GUARDIAN_ROLE) {
         _pause();
     }
 
-    /**
-     * @notice Unpause the farm.
-     * @dev Only the owner (Timelock / DAO) can unpause.
-     */
     function unpause() external onlyOwner {
         _unpause();
     }
@@ -124,11 +138,19 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     // ────────────────────────────── Admin Functions ──────────────────────────────
 
     function setReferralManager(address _ref) external onlyOwner {
+        require(_ref != address(0), "zero ref"); // PAD-15
         referralManager = IReferralManager(_ref);
     }
 
-    function setAutoYieldRouter(address _router) external onlyOwner {
-        autoYieldRouter = _router;
+    // PAD-24 FIX: allow multiple authorized callers for depositFor() on behalf of users
+    function setAutoYieldCaller(address caller, bool allowed) external onlyOwner {
+        require(caller != address(0), "zero caller"); // PAD-15 style
+        if (allowed) {
+            _grantRole(AUTOYIELD_CALLER_ROLE, caller);
+        } else {
+            _revokeRole(AUTOYIELD_CALLER_ROLE, caller);
+        }
+        emit AutoYieldCallerUpdated(caller, allowed);
     }
 
     function setRewardPerBlock(uint256 _rpb) external onlyOwner {
@@ -137,9 +159,30 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         rewardPerBlock = _rpb;
     }
 
+    /**
+     * PAD-04 FIX:
+     * - Pause: accrue up to current block, then freeze emissions.
+     * - Unpause: while still paused, advance each pool's lastRewardBlock to current block (no mint),
+     *   then resume emissions. This excludes paused blocks even if pools weren't updated during pause.
+     */
     function setEmissionsPaused(bool _paused) external onlyOwner {
-        emissionsPaused = _paused;
-        emit EmissionsPaused(_paused);
+        if (_paused == emissionsPaused) return;
+
+        if (_paused) {
+            // Accrue rewards up to this block, then pause emissions.
+            massUpdateAllPools();
+            emissionsPaused = true;
+            emit EmissionsPaused(true);
+            return;
+        }
+
+        // Resume emissions:
+        // While emissionsPaused is still true, updatePool() will NOT accrue rewards,
+        // but WILL set lastRewardBlock = block.number, excluding paused interval.
+        massUpdateAllPools();
+
+        emissionsPaused = false;
+        emit EmissionsPaused(false);
     }
 
     function setPerformanceFee(address _recipient, uint16 _bips) external onlyOwner {
@@ -156,10 +199,21 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         uint64 _cooldown,
         uint256 _min
     ) external onlyOwner {
-        dripper = IRewardDripper(_dripper);
+        require(_min > 0, "min=0");
+
+        if (_dripper != address(0)) {
+            IRewardDripper newDripper = IRewardDripper(_dripper);
+            // PAD-23: enforce reward token match
+            require(newDripper.rewardToken() == address(rewardToken), "reward token mismatch");
+            dripper = newDripper;
+        } else {
+            dripper = IRewardDripper(address(0));
+        }
+
         lowWaterDays = _days;
         dripCooldownSecs = _cooldown;
         minDripAmount = _min;
+
         emit DripperConfigUpdated(_dripper, _days, _cooldown, _min);
     }
 
@@ -173,8 +227,10 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     // ────────────────────────────── Pool Management ──────────────────────────────
 
     function addPool(uint256 _allocPoint, IERC20 _lpToken, uint256 _harvestDelay) external onlyOwner {
+        require(address(_lpToken) != address(0), "zero lpToken"); // PAD-15
         massUpdateAllPools();
         totalAllocPoint += _allocPoint;
+
         poolInfo.push(
             PoolInfo({
                 lpToken: _lpToken,
@@ -186,6 +242,7 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
                 rewardTokenStaked: 0
             })
         );
+
         emit PoolAdded(poolInfo.length - 1, address(_lpToken), _allocPoint, _harvestDelay);
     }
 
@@ -204,7 +261,7 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         if (address(dripper) == address(0) || emissionsPaused || rewardPerBlock == 0) return;
         if (block.timestamp < lastDripAt + dripCooldownSecs) return;
 
-        uint256 need = rewardPerBlock * 115200 * lowWaterDays;
+        uint256 need = rewardPerBlock * 115200 * lowWaterDays; // ~2 blocks/sec assumption used earlier
         if (_availableRewards() >= need) return;
 
         // best-effort; ignore failures
@@ -238,8 +295,9 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         uint256 blocks = block.number - pool.lastRewardBlock;
         uint256 reward = (blocks * rewardPerBlock * pool.allocPoint) / totalAllocPoint;
         if (reward > 0) {
-            pool.accRewardPerShare += (reward * 1e12) / lpSupply;
+            pool.accRewardPerShare += (reward * PRECISION_FACTOR) / lpSupply; // PAD-10
         }
+
         pool.lastRewardBlock = block.number;
     }
 
@@ -251,44 +309,55 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         address _user,
         address _referrer
     ) external nonReentrant whenNotPaused {
-        require(msg.sender == _user || msg.sender == autoYieldRouter, "unauthorized");
+        // PAD-24 FIX:
+        // - user can always deposit for themselves
+        // - Router/Zap/etc can deposit for a user if explicitly authorized
+        bool isAuto = hasRole(AUTOYIELD_CALLER_ROLE, msg.sender);
+        require(msg.sender == _user || isAuto, "unauthorized");
+
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
 
         updatePool(_pid);
 
         if (user.amount > 0) {
-            uint256 pending = (user.amount * pool.accRewardPerShare) / 1e12 - user.rewardDebt;
-            if (pending > 0) {
-                user.unpaid += pending;
-            }
+            uint256 pending = (user.amount * pool.accRewardPerShare) / PRECISION_FACTOR - user.rewardDebt;
+            if (pending > 0) user.unpaid += pending;
         }
+
+        uint256 credited = 0;
 
         if (_amount > 0) {
+            // PAD-07: explicitly reject fee-on-transfer / deflationary / non-standard LP tokens
+            uint256 balBefore = pool.lpToken.balanceOf(address(this));
             pool.lpToken.safeTransferFrom(msg.sender, address(this), _amount);
-            user.amount += _amount;
-            pool.totalStaked += _amount;
+            uint256 received = pool.lpToken.balanceOf(address(this)) - balBefore;
+            require(received == _amount, "Fee-on-transfer/deflationary tokens not supported");
+
+            credited = _amount;
+            user.amount += credited;
+            pool.totalStaked += credited;
 
             if (address(pool.lpToken) == address(rewardToken)) {
-                pool.rewardTokenStaked += _amount;
-                totalRewardTokenStakedAsLP += _amount;
+                pool.rewardTokenStaked += credited;
+                totalRewardTokenStakedAsLP += credited;
             }
 
-            if (msg.sender != autoYieldRouter) {
+            if (!isAuto) {
                 user.lastDepositTime = block.timestamp;
             } else {
-                autoYieldDeposited[_pid][_user] += _amount;
-                emit AutoYieldDeposit(_user, _pid, _amount);
+                autoYieldDeposited[_pid][_user] += credited;
+                emit AutoYieldDeposit(_user, _pid, credited);
             }
         }
 
-        user.rewardDebt = (user.amount * pool.accRewardPerShare) / 1e12;
+        user.rewardDebt = (user.amount * pool.accRewardPerShare) / PRECISION_FACTOR;
 
         if (_referrer != address(0) && address(referralManager) != address(0)) {
             referralManager.recordReferral(_user, _referrer);
         }
 
-        emit Deposit(_user, _pid, _amount);
+        emit Deposit(_user, _pid, credited);
     }
 
     function harvest(uint256 _pid) external nonReentrant whenNotPaused {
@@ -297,9 +366,10 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
 
         updatePool(_pid);
 
-        uint256 pending = (user.amount * pool.accRewardPerShare) / 1e12 - user.rewardDebt;
+        uint256 pending = (user.amount * pool.accRewardPerShare) / PRECISION_FACTOR - user.rewardDebt;
         uint256 gross = user.unpaid + pending;
-        user.rewardDebt = (user.amount * pool.accRewardPerShare) / 1e12;
+
+        user.rewardDebt = (user.amount * pool.accRewardPerShare) / PRECISION_FACTOR;
         user.unpaid = 0;
 
         // Respect harvestDelay
@@ -322,6 +392,7 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
             if (net > 0) {
                 rewardToken.safeTransfer(msg.sender, net);
             }
+
             emit Harvest(msg.sender, _pid, net);
         }
 
@@ -337,11 +408,10 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
 
         updatePool(_pid);
 
-        uint256 pending = (user.amount * pool.accRewardPerShare) / 1e12 - user.rewardDebt;
+        uint256 pending = (user.amount * pool.accRewardPerShare) / PRECISION_FACTOR - user.rewardDebt;
         uint256 gross = user.unpaid + pending;
 
         bool canHarvest = gross > 0 && block.timestamp >= user.lastDepositTime + pool.harvestDelay;
-
         if (canHarvest) {
             uint256 available = _availableRewards();
             uint256 pay = gross > available ? available : gross;
@@ -378,13 +448,14 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
             emit Withdraw(msg.sender, _pid, _amount);
         }
 
-        user.rewardDebt = (user.amount * pool.accRewardPerShare) / 1e12;
+        user.rewardDebt = (user.amount * pool.accRewardPerShare) / PRECISION_FACTOR;
     }
 
     function emergencyWithdraw(uint256 _pid) external nonReentrant {
         // Always available, even when paused
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
+
         uint256 amount = user.amount;
         require(amount > 0, "nothing to withdraw");
 
@@ -393,6 +464,7 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         user.unpaid = 0;
 
         pool.totalStaked -= amount;
+
         if (address(pool.lpToken) == address(rewardToken)) {
             pool.rewardTokenStaked -= amount;
             totalRewardTokenStakedAsLP -= amount;
@@ -407,6 +479,7 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     function pendingReward(uint256 _pid, address _user) public view returns (uint256) {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
+
         uint256 acc = pool.accRewardPerShare;
         uint256 lpSupply = pool.totalStaked;
 
@@ -418,14 +491,14 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         ) {
             uint256 blocks = block.number - pool.lastRewardBlock;
             uint256 reward = (blocks * rewardPerBlock * pool.allocPoint) / totalAllocPoint;
-            acc += (reward * 1e12) / lpSupply;
+            acc += (reward * PRECISION_FACTOR) / lpSupply;
         }
 
-        return user.unpaid + ((user.amount * acc) / 1e12 - user.rewardDebt);
+        return user.unpaid + ((user.amount * acc) / PRECISION_FACTOR - user.rewardDebt);
     }
 
     function pendingRewardAfterFee(uint256 _pid, address _user)
-        public  // <<<<<< changed from external to public
+        public
         view
         returns (uint256 net, uint256 gross)
     {

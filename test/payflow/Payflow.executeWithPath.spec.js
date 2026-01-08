@@ -1,7 +1,7 @@
 /* eslint-disable node/no-unpublished-require */
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { E, now } = require("../helpers");
+const { E } = require("../helpers");
 
 describe("ParagonPayflowExecutorV2 :: executeWithPath()", () => {
   async function fixture() {
@@ -35,13 +35,20 @@ describe("ParagonPayflowExecutorV2 :: executeWithPath()", () => {
     );
     await pf.waitForDeployment();
 
-    // Set notifier for lpReb to allow notify from pf
-    await lpReb.setNotifier(pf.target);
+    // ✅ REQUIRED: authorize executor for BestExecution.consume()
+    await (await be.setAuthorizedExecutor(pf.target, true)).wait();
+    expect(await be.authorizedExecutors(pf.target)).to.equal(true);
+
+    await (await lpReb.setNotifier(pf.target)).wait();
+
+    // ✅ supported tokens gate (all path tokens must be supported)
+    await (await pf.setSupportedToken(A.target, true)).wait();
+    await (await pf.setSupportedToken(B.target, true)).wait();
+    await (await pf.setSupportedToken(C.target, true)).wait();
 
     await (await A.mint(user.address, E("1000"))).wait();
     await (await A.connect(user).approve(pf.target, ethers.MaxUint256)).wait();
 
-    // Fund the router with output tokens for the mock swap
     await (await C.mint(router.target, E("1000"))).wait();
 
     const domain = {
@@ -71,8 +78,8 @@ describe("ParagonPayflowExecutorV2 :: executeWithPath()", () => {
     const { user, A, B, C, router, pf, lpReb, domain, types, be } = await fixture();
     await (await router.setNextAmountOut(E("90"))).wait();
 
-    const path = [A.target, B.target, C.target]; // 2 hops → A->B, B->C
-    const shares = [4000, 6000];                 // length = path.length - 1, sum = 10000
+    const path = [A.target, B.target, C.target];
+    const shares = [4000, 6000];
 
     const currentTime = (await ethers.provider.getBlock("latest")).timestamp;
 
@@ -86,19 +93,20 @@ describe("ParagonPayflowExecutorV2 :: executeWithPath()", () => {
       deadline: BigInt(currentTime + 600),
       nonce: await be.nextNonce(user.address)
     };
+
     const sig = await user.signTypedData(domain, types, it);
     const permit = { value: 0n, deadline: 0n, v: 0, r: "0x" + "00".repeat(32), s: "0x" + "00".repeat(32) };
 
     await (await pf.connect(user).executeWithPath(it, sig, path, shares, permit)).wait();
     expect(await lpReb.count()).to.equal(2n);
 
-    const bad1 = [C.target, B.target, C.target]; // wrong first hop
+    const bad1 = [C.target, B.target, C.target];
     await expect(pf.connect(user).executeWithPath(it, sig, bad1, shares, permit)).to.be.reverted;
 
-    const bad2 = [A.target, B.target, A.target]; // wrong last hop
+    const bad2 = [A.target, B.target, A.target];
     await expect(pf.connect(user).executeWithPath(it, sig, bad2, shares, permit)).to.be.reverted;
 
-    const badShares = [5000, 3000]; // sum != 10000
+    const badShares = [5000, 3000];
     await expect(pf.connect(user).executeWithPath(it, sig, path, badShares, permit)).to.be.reverted;
   });
 });

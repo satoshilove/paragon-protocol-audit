@@ -12,6 +12,7 @@ interface IParagonRouter {
     function factory() external view returns (address);
     function WNative() external view returns (address);
     function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+
     function swapExactTokensForTokens(
         uint amountIn,
         uint amountOutMin,
@@ -19,6 +20,7 @@ interface IParagonRouter {
         address to,
         uint deadline
     ) external returns (uint[] memory amounts);
+
     function swapExactTokensForTokens(
         uint amountIn,
         uint amountOutMin,
@@ -27,6 +29,7 @@ interface IParagonRouter {
         uint deadline,
         uint8 autoYieldPercent
     ) external returns (uint[] memory amounts);
+
     function addLiquidity(
         address tokenA,
         address tokenB,
@@ -37,6 +40,7 @@ interface IParagonRouter {
         address to,
         uint deadline
     ) external returns (uint amountA, uint amountB, uint liquidity);
+
     function protocolFeeBps() external view returns (uint256);
     function feeRecipient() external view returns (address);
 }
@@ -58,6 +62,7 @@ interface IParagonFarm {
     function depositFor(uint256 pid, uint256 amount, address user, address referrer) external;
     function poolLpToken(uint256 pid) external view returns (address);
     function poolInfo(uint256 pid) external view returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accTokenPerShare);
+    function poolLength() external view returns (uint256);
 }
 
 /// @title Wrapped Native Interface for BSC
@@ -85,6 +90,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     error FOTNotSupported();
     error InvalidFeeRecipient();
     error TokenNotRescuable();
+    error UnexpectedMsgValue(); // PAD-18 + native amountIn mismatch
 
     // Zap parameters
     struct ZapParams {
@@ -109,6 +115,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         address feeRecipient; // used only if router doesn’t expose feeRecipient()
         uint256 maxSlippageBps; // user param guard
         uint256 maxPathLength; // path length guard
+        uint256 swapFeeBps; // AMM swap fee in bps (e.g. 30 = 0.30%)
     }
 
     // Events
@@ -147,48 +154,43 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     uint256 private constant MAX_PLATFORM_FEE = 50; // 0.5% fallback cap
     uint256 private constant MAX_REFERRAL_FEE = 20; // 0.2% cap (slice of platform fee)
     uint256 private constant MEV_DELAY = 2; // >= 2 blocks for BSC
+    uint256 private constant SAFE_MATH_LIMIT = type(uint112).max; // Matches pair reserve limit - prevents overflow
 
-    /// @notice Constructor to initialize contract with router, farm, and fee recipient
-    /// @param _router Address of the Paragon router
-    /// @param _farm Address of the farming contract
-    /// @param _feeRecipient Address to receive protocol fees
     constructor(address _router, address _farm, address _feeRecipient) Ownable(msg.sender) {
         router = IParagonRouter(_router);
         factory = IParagonFactory(router.factory());
         WNATIVE = router.WNative();
         farm = IParagonFarm(_farm);
         if (_feeRecipient == address(0) || _feeRecipient.code.length > 0) revert InvalidFeeRecipient();
+
         config = ProtocolConfig({
             platformFeeBps: 25,
             referralFeeBps: 10,
             feeRecipient: _feeRecipient,
             maxSlippageBps: 1000,
-            maxPathLength: 4
+            maxPathLength: 4,
+            swapFeeBps: 30 // 0.30% default
         });
     }
 
     receive() external payable {}
 
-    /// @notice Get the active fee and recipient from router or config
-    /// @return feeBps The active platform fee in basis points
-    /// @return recipient The active fee recipient address
     function getActiveFee() external view returns (uint256 feeBps, address recipient) {
         try router.protocolFeeBps() returns (uint256 rBps) {
             feeBps = rBps;
         } catch {
             feeBps = config.platformFeeBps;
         }
+
         try router.feeRecipient() returns (address rf) {
             recipient = rf;
         } catch {
             recipient = config.feeRecipient;
         }
+
         if (recipient == address(0)) revert InvalidFeeRecipient();
     }
 
-    /// @notice Main function to zap tokens or BNB into LP tokens and optionally stake
-    /// @param p Zap parameters
-    /// @return lpMinted Amount of LP tokens minted
     function zapInAndStake(ZapParams calldata p)
         external
         payable
@@ -200,7 +202,12 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (p.tokenIn != address(0) && p.amountIn == 0) revert ZeroAmount();
         if (p.slippageBps > config.maxSlippageBps) revert SlippageTooHigh();
 
-        // Cache core contracts (gas)
+        // PAD-18: prevent accidental native value with ERC20 zaps
+        if (p.tokenIn != address(0) && msg.value != 0) revert UnexpectedMsgValue();
+
+        // Sanity check for native zaps - amountIn should either be 0 or match msg.value
+        if (p.tokenIn == address(0) && p.amountIn != 0 && p.amountIn != msg.value) revert UnexpectedMsgValue();
+
         IParagonRouter _router = router;
         IParagonFarm _farm = farm;
 
@@ -232,6 +239,12 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         (address lpToken, uint256 allocPoint, , ) = _farm.poolInfo(p.pid);
         if (lpToken == address(0)) revert InvalidPair();
         if (allocPoint == 0) revert FarmNotActive();
+
+        // Verify lpToken consistency + factory pair
+        if (_farm.poolLpToken(p.pid) != lpToken) revert InvalidPair();
+        address expectedPair = factory.getPair(IParagonPair(lpToken).token0(), IParagonPair(lpToken).token1());
+        if (expectedPair != lpToken) revert InvalidPair();
+
         IParagonPair pair = IParagonPair(lpToken);
         (address token0, address token1) = (pair.token0(), pair.token1());
 
@@ -244,40 +257,46 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
             rawAmountIn = _pullTokenReturnAmount(p.tokenIn, msg.sender, p.amountIn);
         }
 
-        // Fees (sync with router)
+        // =======================
+        // Fees (PAD-02 FIX)
+        // =======================
         uint256 platformFeeBps = _activeRouterFeeBps();
         address routerFeeSink = _activeFeeRecipient();
         if (platformFeeBps > MAX_PLATFORM_FEE) revert FeeTooHigh();
 
         uint256 feeAmount = (rawAmountIn * platformFeeBps) / BPS_DENOM;
+
+        // Clamp referral slice to platform fee
         uint256 refBps = config.referralFeeBps > platformFeeBps ? platformFeeBps : config.referralFeeBps;
         uint256 refAmount = (rawAmountIn * refBps) / BPS_DENOM;
-        uint256 protocolFeeNet = feeAmount - refAmount;
 
-        // Pay referral (from fee)
-        if (refAmount > 0 && p.referrer != address(0) && p.referrer != p.recipient) {
+        bool payReferral = (refAmount > 0 && p.referrer != address(0) && p.referrer != p.recipient);
+
+        uint256 refPaid = 0;
+        if (payReferral) {
             if (p.referrer.code.length > 0) revert InvalidFeeRecipient();
             _pay(p.referrer, p.tokenIn, refAmount);
             referralEarnings[p.referrer] += refAmount;
             emit ReferralReward(p.referrer, p.tokenIn, refAmount);
+            refPaid = refAmount;
         }
 
-        // Pay protocol fee remainder
+        // If referral wasn't paid, that slice remains protocol fee (NOT user dust)
+        uint256 protocolFeeNet = feeAmount - refPaid;
         if (protocolFeeNet > 0) _collectFee(p.tokenIn, protocolFeeNet, routerFeeSink);
 
-        // Amount to zap
         uint256 zapAmount = rawAmountIn - feeAmount;
 
-        // Normalize input to WNative for internal flow
+        // =======================
+        // Wrap native (if needed)
+        // =======================
         address tokenInNorm = p.tokenIn == address(0) ? WNATIVE : p.tokenIn;
         if (p.tokenIn == address(0)) {
             IWrappedNative(WNATIVE).deposit{value: zapAmount}();
         }
 
-        // Validate paths with normalized input
         _validatePaths(p.pathToTokenA, p.pathToTokenB, token0, token1, tokenInNorm);
 
-        // Build liquidity amounts
         (uint256 amountA, uint256 amountB) = _prepareLiquidity(
             pair,
             tokenInNorm,
@@ -290,9 +309,9 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
             p.slippageBps
         );
 
-        // Add liquidity (ERC-20 only)
         SafeERC20.forceApprove(IERC20(token0), address(_router), amountA);
         SafeERC20.forceApprove(IERC20(token1), address(_router), amountB);
+
         (,, lpMinted) = _router.addLiquidity(
             token0,
             token1,
@@ -305,7 +324,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         );
         if (lpMinted < p.minLpOut) revert InsufficientOutput();
 
-        // Stake or transfer LP
         if (p.autoStake) {
             SafeERC20.forceApprove(IERC20(lpToken), address(_farm), lpMinted);
             try _farm.depositFor(p.pid, lpMinted, p.recipient, p.referrer) {
@@ -319,10 +337,9 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
             IERC20(lpToken).safeTransfer(p.recipient, lpMinted);
         }
 
-        // Return dust (token0/token1)
         _returnDust(token0, token1, p.recipient);
 
-        // If user paid native, unwrap WNative and refund as BNB (if recipient is EOA)
+        // Refund any leftover WNATIVE from wrapping (native zaps only)
         if (p.tokenIn == address(0)) {
             uint256 wBal = IERC20(WNATIVE).balanceOf(address(this));
             if (wBal > 0) {
@@ -349,15 +366,11 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         );
     }
 
-    /// @notice Commit a zap transaction for MEV protection
-    /// @param paramsHash Hash of the ZapParams to commit
     function commitZap(bytes32 paramsHash) external {
         bytes32 commitment = keccak256(abi.encode(paramsHash, msg.sender));
         commitments[commitment] = block.number;
     }
 
-    /// @notice Get the active fee from router or config
-    /// @return feeBps The active platform fee in basis points
     function _activeRouterFeeBps() internal view returns (uint256 feeBps) {
         try router.protocolFeeBps() returns (uint256 rBps) {
             feeBps = rBps;
@@ -366,8 +379,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         }
     }
 
-    /// @notice Get the active fee recipient from router or config
-    /// @return recipient The active fee recipient address
     function _activeFeeRecipient() internal view returns (address recipient) {
         try router.feeRecipient() returns (address rf) {
             recipient = rf;
@@ -377,12 +388,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (recipient == address(0)) revert InvalidFeeRecipient();
     }
 
-    /// @notice Validate swap paths for correctness
-    /// @param pathA Path to token0
-    /// @param pathB Path to token1
-    /// @param token0 Address of pair's token0
-    /// @param token1 Address of pair's token1
-    /// @param tokenInNorm Normalized input token (WNative for native)
     function _validatePaths(
         address[] calldata pathA,
         address[] calldata pathB,
@@ -395,12 +400,12 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (pathB.length > 0 && pathB[pathB.length - 1] != token1) revert InvalidPath();
         if (pathA.length > 0 && pathA[0] != tokenInNorm) revert InvalidPath();
         if (pathB.length > 0 && pathB[0] != tokenInNorm) revert InvalidPath();
+
         bool inputIsSide = (tokenInNorm == token0 || tokenInNorm == token1);
         if (!inputIsSide && (pathA.length == 0 || pathB.length == 0)) revert InvalidPath();
         if (inputIsSide && (pathA.length > 0 || pathB.length > 0)) revert InvalidPath();
     }
 
-    /// @notice Prepare liquidity amounts for single-sided or dual-sided zaps
     function _prepareLiquidity(
         IParagonPair pair,
         address tokenInNorm,
@@ -419,7 +424,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         return _dualSidedZap(tokenInNorm, amountIn, pathToA, pathToB, deadline, slippageBps);
     }
 
-    /// @notice Handle single-sided zap (input is one of the pair tokens)
     function _singleSidedZap(
         address tokenInNorm,
         uint256 amountIn,
@@ -431,17 +435,33 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         uint256 slippageBps
     ) internal returns (uint256 amountA, uint256 amountB) {
         bool inIs0 = (tokenInNorm == token0);
+        uint256 reserveIn = inIs0 ? uint256(r0) : uint256(r1);
+        uint256 reserveOut = inIs0 ? uint256(r1) : uint256(r0);
+
+        // Safety - require existing liquidity for single-sided math
+        if (reserveIn == 0 || reserveOut == 0) revert InvalidPair();
+
+        uint256 swapPortion = _optimalSwapPortionSingle(amountIn, reserveIn, config.swapFeeBps);
+
         address[] memory path = new address[](2);
         path[0] = tokenInNorm;
         path[1] = inIs0 ? token1 : token0;
-        uint256 swapPortion = _optimalSwapPortion(amountIn, inIs0 ? r0 : r1, inIs0 ? r1 : r0, path);
-        uint256 outB = _swapExact(tokenInNorm, swapPortion, path, address(this), deadline, slippageBps);
+
+        uint256 expectedOut = _getAmountOut(swapPortion, reserveIn, reserveOut, config.swapFeeBps);
+        uint256 amountOutMin = _applySlippage(expectedOut, slippageBps);
+
+        uint256 outB = _swapExactWithMin(tokenInNorm, swapPortion, path, address(this), deadline, amountOutMin);
+
         uint256 remainA = amountIn - swapPortion;
-        if (inIs0) { amountA = remainA; amountB = outB; }
-        else { amountA = outB; amountB = remainA; }
+        if (inIs0) {
+            amountA = remainA;
+            amountB = outB;
+        } else {
+            amountA = outB;
+            amountB = remainA;
+        }
     }
 
-    /// @notice Handle dual-sided zap (input is swapped to both pair tokens)
     function _dualSidedZap(
         address tokenInNorm,
         uint256 amountIn,
@@ -451,52 +471,89 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         uint256 slippageBps
     ) internal returns (uint256 amountA, uint256 amountB) {
         uint256 half = amountIn / 2;
-        amountA = pathToA.length > 0 ? _swapExact(tokenInNorm, half, pathToA, address(this), deadline, slippageBps) : half;
-        amountB = pathToB.length > 0 ? _swapExact(tokenInNorm, amountIn - half, pathToB, address(this), deadline, slippageBps) : (amountIn - half);
+        amountA = pathToA.length > 0
+            ? _swapExact(tokenInNorm, half, pathToA, address(this), deadline, slippageBps)
+            : half;
+
+        amountB = pathToB.length > 0
+            ? _swapExact(tokenInNorm, amountIn - half, pathToB, address(this), deadline, slippageBps)
+            : (amountIn - half);
     }
 
-    /// @notice Calculate optimal swap portion for single-sided zap
-    function _optimalSwapPortion(
+    // Closed-form optimal swap with overflow + invalid fee protection
+    function _optimalSwapPortionSingle(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 feeBps
+    ) internal pure returns (uint256 swapPortion) {
+        // Prevent invalid fee (would cause div by zero later)
+        if (feeBps >= BPS_DENOM) {
+            return (amountIn * 4990) / 10_000;
+        }
+
+        // Prevent overflow griefing - clamp to pair reserve limit
+        if (amountIn > SAFE_MATH_LIMIT || reserveIn > SAFE_MATH_LIMIT) {
+            return (amountIn * 4990) / 10_000;
+        }
+
+        uint256 a = BPS_DENOM - feeBps;
+        uint256 b = BPS_DENOM;
+
+        uint256 term1 = amountIn * 4 * a * b;
+        uint256 term2 = reserveIn * (a + b) * (a + b);
+        uint256 radicand = reserveIn * (term1 + term2);
+
+        uint256 root = _sqrt(radicand);
+
+        if (root <= reserveIn * (a + b)) {
+            return (amountIn * 4990) / 10_000;
+        }
+
+        uint256 num = root - (reserveIn * (a + b));
+        swapPortion = num / (2 * a);
+
+        if (swapPortion > amountIn) swapPortion = (amountIn * 4990) / 10_000;
+    }
+
+    function _getAmountOut(
         uint256 amountIn,
         uint256 reserveIn,
         uint256 reserveOut,
-        address[] memory path
-    ) internal view returns (uint256 swapPortion) {
-        uint256 lo = 0;
-        uint256 hi = amountIn;
-        uint256 mid;
-        uint256 outMid;
-        for (uint256 i = 0; i < 18; i++) {
-            mid = (lo + hi) / 2;
-            try router.getAmountsOut(mid, path) returns (uint[] memory am) {
-                outMid = am[am.length - 1];
-                uint256 lhs = (amountIn - mid) * reserveOut;
-                uint256 rhs = outMid * reserveIn;
-                if (lhs > rhs) { lo = mid + 1; } else { hi = mid; }
-            } catch {
-                return (amountIn * 4990) / 10_000; // ~49.9% fallback
-            }
-        }
-        swapPortion = hi;
+        uint256 feeBps
+    ) internal pure returns (uint256) {
+        if (amountIn == 0) return 0;
+        uint256 a = BPS_DENOM - feeBps;
+        uint256 amountInWithFee = amountIn * a;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = reserveIn * BPS_DENOM + amountInWithFee;
+        return numerator / denominator;
     }
 
-    /// @notice Perform a token swap with slippage protection
-    function _swapExact(
+    function _sqrt(uint256 y) internal pure returns (uint256 z) {
+        if (y == 0) return 0;
+        uint256 x = y / 2 + 1;
+        z = y;
+        while (x < z) {
+            z = x;
+            x = (y / x + x) / 2;
+        }
+    }
+
+    function _swapExactWithMin(
         address tokenFrom,
         uint256 amountIn,
         address[] memory path,
         address to,
         uint256 deadline,
-        uint256 slippageBps
+        uint256 amountOutMin
     ) internal returns (uint256 amountOut) {
         if (amountIn == 0) return 0;
         if (path.length < 2) return amountIn;
+
         IParagonRouter _router = router;
-        uint[] memory expectedAmts = _router.getAmountsOut(amountIn, path);
-        uint256 expectedOut = expectedAmts[expectedAmts.length - 1];
-        uint256 amountOutMin = _applySlippage(expectedOut, slippageBps);
         SafeERC20.forceApprove(IERC20(tokenFrom), address(_router), 0);
         SafeERC20.forceApprove(IERC20(tokenFrom), address(_router), amountIn);
+
         try _router.swapExactTokensForTokens(amountIn, amountOutMin, path, to, deadline, 0) returns (uint[] memory amts) {
             amountOut = amts[amts.length - 1];
         } catch {
@@ -505,7 +562,33 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         }
     }
 
-    /// @notice Pull tokens from user and revert on FOT
+    function _swapExact(
+        address tokenFrom,
+        uint256 amountIn,
+        address[] calldata path,
+        address to,
+        uint256 deadline,
+        uint256 slippageBps
+    ) internal returns (uint256 amountOut) {
+        if (amountIn == 0) return 0;
+        if (path.length < 2) return amountIn;
+
+        IParagonRouter _router = router;
+        uint[] memory expectedAmts = _router.getAmountsOut(amountIn, path);
+        uint256 expectedOut = expectedAmts[expectedAmts.length - 1];
+        uint256 amountOutMin = _applySlippage(expectedOut, slippageBps);
+
+        SafeERC20.forceApprove(IERC20(tokenFrom), address(_router), 0);
+        SafeERC20.forceApprove(IERC20(tokenFrom), address(_router), amountIn);
+
+        try _router.swapExactTokensForTokens(amountIn, amountOutMin, path, to, deadline, 0) returns (uint[] memory amts) {
+            amountOut = amts[amts.length - 1];
+        } catch {
+            uint[] memory amts = _router.swapExactTokensForTokens(amountIn, amountOutMin, path, to, deadline);
+            amountOut = amts[amts.length - 1];
+        }
+    }
+
     function _pullTokenReturnAmount(address token, address from, uint256 amount)
         internal
         returns (uint256 received)
@@ -516,9 +599,9 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (received != amount) revert FOTNotSupported();
     }
 
-    /// @notice Pay tokens or BNB to an address
     function _pay(address to, address token, uint256 amount) internal {
         if (amount == 0) return;
+
         if (token == address(0)) {
             (bool ok,) = to.call{value: amount}("");
             require(ok, "pay fail");
@@ -529,14 +612,12 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         }
     }
 
-    /// @notice Collect protocol fees
     function _collectFee(address token, uint256 amount, address recipient) internal {
         if (amount == 0) return;
         _pay(recipient, token, amount);
         emit FeeCollected(token, amount, recipient);
     }
 
-    /// @notice Return leftover tokens to user
     function _returnDust(address token0, address token1, address to) internal {
         uint256 b0 = IERC20(token0).balanceOf(address(this));
         uint256 b1 = IERC20(token1).balanceOf(address(this));
@@ -544,7 +625,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (b1 > 0) IERC20(token1).safeTransfer(to, b1);
     }
 
-    /// @notice Apply slippage to an amount
     function _applySlippage(uint256 amount, uint256 slippageBps) internal pure returns (uint256) {
         if (slippageBps == 0) return amount;
         if (slippageBps > 1000) slippageBps = 1000;
@@ -552,59 +632,59 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     }
 
     // ========= Admin =========
-    /// @notice Update protocol configuration
-    /// @param newConfig New protocol configuration
     function updateProtocolConfig(ProtocolConfig calldata newConfig) external onlyOwner {
         if (newConfig.platformFeeBps > MAX_PLATFORM_FEE) revert FeeTooHigh();
         if (newConfig.referralFeeBps > MAX_REFERRAL_FEE) revert FeeTooHigh();
         if (newConfig.feeRecipient == address(0) || newConfig.feeRecipient.code.length > 0) revert InvalidFeeRecipient();
+        if (newConfig.swapFeeBps > 100) revert FeeTooHigh(); // cap at 1.00%
         config = newConfig;
         emit ProtocolConfigUpdated(newConfig);
     }
 
-    /// @notice Pause the contract
-    function pause() external onlyOwner {
-        _pause();
-    }
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
 
-    /// @notice Unpause the contract
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    /// @notice Emergency withdraw tokens or BNB (restricted to non-LP/pair tokens)
-    /// @param token Token to withdraw (address(0) for BNB)
-    /// @param amount Amount to withdraw
     function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
-        // Check if token is an LP token or pair asset
-        for (uint256 pid = 0; pid < 100; pid++) {
+        uint256 n = farm.poolLength();
+        for (uint256 pid = 0; pid < n; pid++) {
             address lpToken = farm.poolLpToken(pid);
-            if (lpToken == address(0)) break; // End of valid PIDs
+            if (lpToken == address(0)) continue;
+
             if (token == lpToken) revert TokenNotRescuable();
             IParagonPair pair = IParagonPair(lpToken);
             if (token == pair.token0() || token == pair.token1()) revert TokenNotRescuable();
         }
+
         if (token == WNATIVE) revert TokenNotRescuable();
+
         if (token == address(0)) {
             (bool ok,) = owner().call{value: amount}("");
             require(ok, "transfer fail");
         } else {
             IERC20(token).safeTransfer(owner(), amount);
         }
+
         emit EmergencyWithdraw(token, amount);
     }
 
     // ========= Views =========
-    /// @notice Get optimal swap amount for a pair
-    /// @param amountIn Input amount
-    /// @param pairAddr Address of the pair
-    /// @return swapAmount Optimal amount to swap
-    function getOptimalSwapAmount(uint256 amountIn, address pairAddr) external view returns (uint256 swapAmount) {
+    function getOptimalSwapAmount(uint256 amountIn, address pairAddr, address tokenIn)
+        external
+        view
+        returns (uint256 swapAmount)
+    {
         IParagonPair pair = IParagonPair(pairAddr);
         (uint112 r0, uint112 r1,) = pair.getReserves();
-        address[] memory path = new address[](2);
-        path[0] = pair.token0();
-        path[1] = pair.token1();
-        return _optimalSwapPortion(amountIn, r0, r1, path);
+        address t0 = pair.token0();
+        address t1 = pair.token1();
+        if (tokenIn != t0 && tokenIn != t1) revert InvalidPath();
+        uint256 reserveIn = (tokenIn == t0) ? uint256(r0) : uint256(r1);
+
+        // Apply same safety bounds as internal function
+        if (amountIn > SAFE_MATH_LIMIT || reserveIn > SAFE_MATH_LIMIT) {
+            return (amountIn * 4990) / 10_000;
+        }
+
+        return _optimalSwapPortionSingle(amountIn, reserveIn, config.swapFeeBps);
     }
 }

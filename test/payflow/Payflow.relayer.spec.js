@@ -1,7 +1,7 @@
 /* eslint-disable node/no-unpublished-require */
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { E, now } = require("../helpers");
+const { E } = require("../helpers");
 
 describe("ParagonPayflowExecutorV2 :: relayer fee behavior", () => {
   async function fixture() {
@@ -12,16 +12,16 @@ describe("ParagonPayflowExecutorV2 :: relayer fee behavior", () => {
     const Out = await ERC.deploy("O","O",18);  await Out.waitForDeployment();
 
     const Router = await ethers.getContractFactory("MockRouter");
-    const router = await Router.deploy();       await router.waitForDeployment();
+    const router = await Router.deploy(); await router.waitForDeployment();
 
     const Reb = await ethers.getContractFactory("MockLPFlowRebates");
-    const lpReb = await Reb.deploy();           await lpReb.waitForDeployment();
+    const lpReb = await Reb.deploy(); await lpReb.waitForDeployment();
 
     const BE = await ethers.getContractFactory("ParagonBestExecutionV14");
-    const be = await BE.deploy(owner.address);               await be.waitForDeployment();
+    const be = await BE.deploy(owner.address); await be.waitForDeployment();
 
     const Locker = await ethers.getContractFactory("MockLocker");
-    const lock = await Locker.deploy();         await lock.waitForDeployment();
+    const lock = await Locker.deploy(); await lock.waitForDeployment();
 
     const Payflow = await ethers.getContractFactory("ParagonPayflowExecutorV2");
     const pf = await Payflow.deploy(
@@ -34,19 +34,31 @@ describe("ParagonPayflowExecutorV2 :: relayer fee behavior", () => {
     );
     await pf.waitForDeployment();
 
-    // Set notifier for lpReb to allow notify from pf
-    await lpReb.setNotifier(pf.target);
+    // ✅ BestExec: allow PayflowExecutor to call consume()
+    await (await be.setAuthorizedExecutor(pf.target, true)).wait();
 
-    // relayer fee bps (0.10%), from SURPLUS only
+    // ✅ LP rebates mock: allow notify from pf (optional for relayer tests, but harmless)
+    await (await lpReb.setNotifier(pf.target)).wait();
+
+    // ✅ Token allowlist gate (REQUIRED)
+    await (await pf.setSupportedToken(In.target, true)).wait();
+    await (await pf.setSupportedToken(Out.target, true)).wait();
+
+    // ✅ Relayer allowlist + fee bps (10 bps = 0.10%), paid from SURPLUS only
+    await (await pf.setRelayer(relayer.address, true)).wait();
     await (await pf.setRelayerFeeBips(10)).wait();
 
-    await (await In.mint(user.address, E("100"))).wait();
+    // Fund user + approvals
+    await (await In.mint(user.address, E("1000"))).wait();
     await (await In.connect(user).approve(pf.target, ethers.MaxUint256)).wait();
 
-    // Fund the router with output tokens for the mock swap
-    await (await Out.mint(router.target, E("1000"))).wait();
+    // Fund router with output tokens for the mock swap
+    await (await Out.mint(router.target, E("1000000"))).wait();
 
-    if (router.setTokenOut) { await (await router.setTokenOut(Out.target)).wait(); }
+    // If your MockRouter supports tokenOut config, set it
+    if (router.setTokenOut) {
+      await (await router.setTokenOut(Out.target)).wait();
+    }
 
     const domain = {
       name: "ParagonBestExecution",
@@ -68,12 +80,13 @@ describe("ParagonPayflowExecutorV2 :: relayer fee behavior", () => {
       ]
     };
 
-    return { user, relayer, In, Out, router, pf, domain, types, be };
+    return { owner, user, relayer, daoVault, In, Out, router, pf, domain, types, be };
   }
 
   it("INV-PF-08: relayer fee only when caller!=user and only from surplus above minOut", async () => {
     const { user, relayer, In, Out, router, pf, domain, types, be } = await fixture();
 
+    // output > minOut => surplus exists
     await (await router.setNextAmountOut(E("100.05"))).wait(); // surplus = 0.05
 
     const currentTime = (await ethers.provider.getBlock("latest")).timestamp;
@@ -88,19 +101,30 @@ describe("ParagonPayflowExecutorV2 :: relayer fee behavior", () => {
       deadline: BigInt(currentTime + 600),
       nonce: await be.nextNonce(user.address)
     };
+
     const sig = await user.signTypedData(domain, types, it);
     const permit = { value: 0n, deadline: 0n, v: 0, r: "0x" + "00".repeat(32), s: "0x" + "00".repeat(32) };
 
-    const before = await Out.balanceOf(user.address);
-    await (await pf.connect(relayer).execute(it, sig, permit)).wait();
-    const after  = await Out.balanceOf(user.address);
+    const beforeUser = await Out.balanceOf(user.address);
+    const beforeRelayer = await Out.balanceOf(relayer.address);
 
-    expect(after - before).to.be.gte(E("100")); // user never below minOut
+    await (await pf.connect(relayer).execute(it, sig, permit)).wait();
+
+    const afterUser = await Out.balanceOf(user.address);
+    const afterRelayer = await Out.balanceOf(relayer.address);
+
+    // user never below minOut
+    expect(afterUser - beforeUser).to.be.gte(E("100"));
+
+    // relayer should get >0 when surplus exists (may be tiny but >0)
+    expect(afterRelayer).to.be.gt(beforeRelayer);
   });
 
   it("INV-PF-08: zero relayer fee when there is no surplus", async () => {
     const { user, relayer, In, Out, router, pf, domain, types, be } = await fixture();
-    await (await router.setNextAmountOut(E("100"))).wait(); // exactly minOut
+
+    // output == minOut => no surplus
+    await (await router.setNextAmountOut(E("100"))).wait();
 
     const currentTime = (await ethers.provider.getBlock("latest")).timestamp;
 
@@ -114,13 +138,22 @@ describe("ParagonPayflowExecutorV2 :: relayer fee behavior", () => {
       deadline: BigInt(currentTime + 600),
       nonce: await be.nextNonce(user.address)
     };
+
     const sig = await user.signTypedData(domain, types, it);
     const permit = { value: 0n, deadline: 0n, v: 0, r: "0x" + "00".repeat(32), s: "0x" + "00".repeat(32) };
 
-    const before = await Out.balanceOf(user.address);
-    await (await pf.connect(relayer).execute(it, sig, permit)).wait();
-    const after  = await Out.balanceOf(user.address);
+    const beforeUser = await Out.balanceOf(user.address);
+    const beforeRelayer = await Out.balanceOf(relayer.address);
 
-    expect(after - before).to.equal(E("100")); // exactly minOut ⇒ zero relayer fee
+    await (await pf.connect(relayer).execute(it, sig, permit)).wait();
+
+    const afterUser = await Out.balanceOf(user.address);
+    const afterRelayer = await Out.balanceOf(relayer.address);
+
+    // user gets exactly minOut (since surplus=0 and traderShare=0)
+    expect(afterUser - beforeUser).to.equal(E("100"));
+
+    // relayer gets nothing when no surplus
+    expect(afterRelayer - beforeRelayer).to.equal(0n);
   });
 });

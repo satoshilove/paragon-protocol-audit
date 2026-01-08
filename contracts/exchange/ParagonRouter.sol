@@ -28,6 +28,18 @@ interface IParagonOracle {
         returns (uint[] memory amounts);
 }
 
+/// @dev Router-admin policy module the Router can read from (whitelist + UI helpers + tolerances).
+interface IParagonRouterAdmin {
+    function whitelistEnabled() external view returns (bool);
+    function whitelist(address) external view returns (bool);
+    function feeOnTransferTolerance() external view returns (uint32);
+}
+
+/// @dev minimal paused() interface for XPGN kill-switch
+interface IPausableToken {
+    function paused() external view returns (bool);
+}
+
 contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -39,23 +51,28 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     IParagonFarmController public immutable masterChef;
 
     // ---------------------------------------------------------
+    // RouterAdmin policy module (optional)
+    // ---------------------------------------------------------
+    IParagonRouterAdmin public admin;
+
+    // ---------------------------------------------------------
     // Oracle guard (configurable)
     // ---------------------------------------------------------
-    IParagonOracle public priceOracle;   // optional; set after deploy
+    IParagonOracle public priceOracle; // optional; set after deploy
 
-    bool   public guardEnabled    = true;   // global toggle — ON at launch
-    bool   public useChainlink    = false;  // change to true later if you add Chainlink feeds
-    bool   public failOpen        = false;  // fail-closed by default (max protection)
-    uint16 public maxSlippageBips = 50;     // 0.5% oracle slippage
-    uint16 public maxImpactBips   = 100;    // 1.0% price impact
+    bool   public guardEnabled    = true;   // global toggle
+    bool   public useChainlink    = false;
+    bool   public failOpen        = false;  // fail-closed by default
+    uint16 public maxSlippageBips = 50;     // 0.5%
+    uint16 public maxImpactBips   = 100;    // 1.0%
 
     mapping(address => bool) public protectedToken;
 
     // ---------------------------------------------------------
     // Auto-yield config (configurable)
     // ---------------------------------------------------------
-    uint256 public autoYieldPid = 0;        // default PID for auto-yield deposits
-    bool    public autoYieldEnabled = true; // global toggle
+    uint256 public autoYieldPid = 0;
+    bool    public autoYieldEnabled = true;
 
     // Per-user auto-yield preference (percent 0..3). 255 = use saved pref in swap calls.
     mapping(address => uint8) public userAutoYieldBips;
@@ -64,8 +81,7 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     // ---------------------------------------------------------
     // Events
     // ---------------------------------------------------------
-
-    // New event (NOT in interface) — safe to declare here
+    event AdminUpdated(address indexed admin);
     event AutoYieldPreferenceSet(address indexed user, uint8 bips);
 
     constructor(address _factory, address _WNative, address _masterChef) Ownable(msg.sender) {
@@ -80,6 +96,11 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     }
 
     // ---------------------- Admin ----------------------
+    function setAdmin(address _admin) external onlyOwner {
+        admin = IParagonRouterAdmin(_admin);
+        emit AdminUpdated(_admin);
+    }
+
     function setOracle(address _oracle) external onlyOwner {
         priceOracle = IParagonOracle(_oracle);
         emit OracleUpdated(_oracle);
@@ -106,7 +127,6 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         emit ProtectedTokenSet(token, isProtected);
     }
 
-    // Configure which pool receives auto-yield deposits, and enable/disable globally
     function setAutoYieldConfig(uint256 _pid, bool _enabled) external onlyOwner {
         autoYieldPid = _pid;
         autoYieldEnabled = _enabled;
@@ -126,21 +146,50 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         _;
     }
 
+    // ---------------------- Policy checks (whitelist + XPGN pause) ----------------------
+    function _enforceWhitelist() internal view {
+        if (address(admin) == address(0)) return;
+        if (admin.whitelistEnabled()) {
+            require(admin.whitelist(msg.sender), "Paragon: NOT_WHITELISTED");
+        }
+    }
+
+    function _enforceXpgnNotPaused(address[] memory path) internal view {
+        address xpgn = IParagonFactory(factory).xpgnToken();
+        if (xpgn == address(0)) return;
+
+        for (uint i = 0; i < path.length; ++i) {
+            if (path[i] == xpgn) {
+                require(!IPausableToken(xpgn).paused(), "Paragon: XPGN_PAUSED");
+                return;
+            }
+        }
+    }
+
+    function _fotToleranceBips() internal view returns (uint32) {
+        if (address(admin) == address(0)) return 0;
+        return admin.feeOnTransferTolerance();
+    }
+
+    function _enforceFOTTolerance(uint256 expectedIn, uint256 actualIn) internal view {
+        uint32 tol = _fotToleranceBips();
+        if (tol == 0) return;
+        require(actualIn * 10000 >= expectedIn * (10000 - uint256(tol)), "Paragon: FOT_TOO_HIGH");
+    }
+
     // ---------------------- Internals (auto-yield) ----------------------
     function _effectiveAutoYieldPercent(
         address msgSender,
         address to,
         uint8 autoYieldPercentParam
-    ) internal view returns (uint8 p) {
+    ) internal view returns (uint8) {
         if (!autoYieldEnabled) return 0;
 
-        // Explicit override 0..3 only valid when the receiver is the caller
         if (autoYieldPercentParam != USE_SAVED_PREF) {
             if (autoYieldPercentParam > 3) return 3;
-            return (to == msgSender) ? autoYieldPercentParam : uint8(0);
+            return (to == msgSender) ? autoYieldPercentParam : 0;
         }
 
-        // USE_SAVED_PREF (255): only honor if receiver is the caller
         if (to == msgSender) {
             uint8 saved = userAutoYieldBips[msgSender];
             return saved > 3 ? 3 : saved;
@@ -149,42 +198,54 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         return 0;
     }
 
+    function _isXPGN(address token) internal view returns (bool) {
+        address xpgn = IParagonFactory(factory).xpgnToken();
+        return xpgn != address(0) && token == xpgn;
+    }
+
+    function _shouldCustodyForAutoYield(address outToken, uint8 eff) internal view returns (bool) {
+        return autoYieldEnabled && eff > 0 && _isXPGN(outToken);
+    }
+
+    function _minGrossOutForNet(uint256 amountOutMinNet, uint8 eff) internal pure returns (uint256) {
+        if (eff == 0) return amountOutMinNet;
+        uint8 cappedEff = eff > 3 ? 3 : eff;
+        uint256 denom = 100 - cappedEff;
+        return (amountOutMinNet * 100 + (denom - 1)) / denom;
+    }
+
     function _handleAutoYield(address outToken, uint256 amountOut, address to, uint8 autoYieldPercent) internal {
         if (amountOut == 0) return;
 
         address xpgn = IParagonFactory(factory).xpgnToken();
 
-        // If disabled, or not XPGN, or user set 0%, just transfer out
         if (!autoYieldEnabled || autoYieldPercent == 0 || xpgn == address(0) || outToken != xpgn) {
             IERC20(outToken).safeTransfer(to, amountOut);
             return;
         }
 
-        // Cap at 3%
-        if (autoYieldPercent > 3) autoYieldPercent = 3;
+        uint8 eff = autoYieldPercent > 3 ? 3 : autoYieldPercent;
 
-        uint256 yieldAmount = (amountOut * autoYieldPercent) / 100;
+        uint256 yieldAmount = (amountOut * eff) / 100;
         if (yieldAmount == 0) {
             IERC20(xpgn).safeTransfer(to, amountOut);
             return;
         }
 
-        uint256 userAmount  = amountOut - yieldAmount;
+        uint256 userAmount = amountOut - yieldAmount;
 
-        // Send user portion
         IERC20(xpgn).safeTransfer(to, userAmount);
 
-        // Approve & deposit yield (best-effort)
         IERC20(xpgn).forceApprove(address(masterChef), 0);
         IERC20(xpgn).forceApprove(address(masterChef), yieldAmount);
 
         try masterChef.depositFor(autoYieldPid, yieldAmount, to, address(0)) {
             IERC20(xpgn).forceApprove(address(masterChef), 0);
-            emit AutoYieldStaked(to, yieldAmount, autoYieldPercent);
+            emit AutoYieldStaked(to, yieldAmount, eff);
         } catch {
             IERC20(xpgn).forceApprove(address(masterChef), 0);
             IERC20(xpgn).safeTransfer(to, yieldAmount);
-            emit AutoYieldFailed(to, yieldAmount, autoYieldPercent);
+            emit AutoYieldFailed(to, yieldAmount, eff);
         }
     }
 
@@ -231,7 +292,9 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
 
     function _oracleMinOutMaybe(uint amountIn, address[] memory route) internal view returns (uint minOut, bool ok) {
         if (address(priceOracle) == address(0)) return (0, false);
+
         uint[] memory o;
+
         if (useChainlink) {
             try priceOracle.getAmountsOutUsingChainlink(amountIn, route) returns (uint[] memory arr) {
                 o = arr;
@@ -245,27 +308,44 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
                 return (0, false);
             }
         }
+
         if (o.length == 0) return (0, false);
+
         uint quoteOut = o[o.length - 1];
         if (quoteOut == 0) return (0, false);
+
         minOut = (quoteOut * (10000 - maxSlippageBips)) / 10000;
         ok = true;
     }
 
-    function _impactBips(uint amountIn, address[] memory route, uint[] memory amts) internal view returns (uint16) {
-        (uint rIn, uint rOut, ) = ParagonLibrary.getReserves(factory, route[0], route[1]);
-        if (rIn == 0 || rOut == 0) return type(uint16).max;
-        uint ideal = (amountIn * rOut) / rIn; // linear approx
-        if (ideal == 0) return type(uint16).max;
-        uint got = amts[1];
-        if (got >= ideal) return 0;
-        uint diff = ideal - got;
-        uint bips = (diff * 10000) / ideal;
-        if (bips > type(uint16).max) bips = type(uint16).max;
-        return uint16(bips);
+    function _impactBips(uint /*amountIn*/, address[] memory route, uint[] memory amounts) internal view returns (uint16) {
+        uint16 maxBips = 0;
+
+        for (uint i = 0; i < route.length - 1; i++) {
+            if (!(protectedToken[route[i]] || protectedToken[route[i + 1]])) continue;
+
+            (uint rIn, uint rOut, ) = ParagonLibrary.getReserves(factory, route[i], route[i + 1]);
+            if (rIn == 0 || rOut == 0) return type(uint16).max;
+
+            uint hopIn = amounts[i];
+            if (hopIn == 0) return type(uint16).max;
+
+            uint ideal = (hopIn * rOut) / rIn;
+            if (ideal == 0) return type(uint16).max;
+
+            uint got = amounts[i + 1];
+            if (got >= ideal) continue;
+
+            uint diff = ideal - got;
+            uint bips = (diff * 10000) / ideal;
+            if (bips > type(uint16).max) bips = type(uint16).max;
+
+            if (bips > maxBips) maxBips = uint16(bips);
+        }
+
+        return maxBips;
     }
 
-    /// @dev Unified oracle + impact guard — applied to all exact-input swaps when protected tokens are involved
     function _enforceOracleGuard(
         uint256 amountIn,
         address[] memory path,
@@ -284,9 +364,31 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
             require(amountOut >= minOut, "Paragon: ORACLE_SLIPPAGE");
         }
 
-        // Price impact check using constant-product math (no oracle needed)
         uint256[] memory amountsCalc = ParagonLibrary.getAmountsOut(factory, amountIn, path);
         uint16 impact = _impactBips(amountIn, path, amountsCalc);
+        require(impact <= maxImpactBips, "Paragon: PRICE_IMPACT");
+    }
+
+    function _enforceOracleGuardPostSwap(
+        uint256 effectiveIn,
+        address[] memory path,
+        uint256 actualOut
+    ) internal {
+        if (!guardEnabled || !_pathHasProtected(path)) return;
+
+        (uint256 minOut, bool oracleOk) = _oracleMinOutMaybe(effectiveIn, path);
+
+        if (failOpen) {
+            if (oracleOk && minOut > 0) {
+                require(actualOut >= minOut, "Paragon: ORACLE_SLIPPAGE");
+            }
+        } else {
+            require(oracleOk && minOut > 0, "Paragon: ORACLE_FAIL");
+            require(actualOut >= minOut, "Paragon: ORACLE_SLIPPAGE");
+        }
+
+        uint256[] memory amountsCalc = ParagonLibrary.getAmountsOut(factory, effectiveIn, path);
+        uint16 impact = _impactBips(effectiveIn, path, amountsCalc);
         require(impact <= maxImpactBips, "Paragon: PRICE_IMPACT");
     }
 
@@ -332,7 +434,7 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         external
         view
         override
-        returns (uint[] memory amts)
+        returns (uint[] memory amounts)
     {
         address[] memory r = path;
         _checkPath(r);
@@ -343,7 +445,7 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         external
         view
         override
-        returns (uint[] memory amts)
+        returns (uint[] memory amounts)
     {
         address[] memory r = path;
         _checkPath(r);
@@ -390,6 +492,13 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         nonReentrant
         returns (uint amountA, uint amountB, uint liquidity)
     {
+        _enforceWhitelist();
+
+        address[] memory path = new address[](2);
+        path[0] = tokenA;
+        path[1] = tokenB;
+        _enforceXpgnNotPaused(path);
+
         (amountA, amountB) = _addLiquidity(
             tokenA,
             tokenB,
@@ -420,6 +529,13 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         nonReentrant
         returns (uint amountToken, uint amountNative, uint liquidity)
     {
+        _enforceWhitelist();
+
+        address[] memory path = new address[](2);
+        path[0] = token;
+        path[1] = WNative;
+        _enforceXpgnNotPaused(path);
+
         (amountToken, amountNative) = _addLiquidity(
             token,
             WNative,
@@ -433,9 +549,10 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         IWETH(WNative).deposit{value: amountNative}();
         assert(IWETH(WNative).transfer(pair, amountNative));
         liquidity = IParagonPair(pair).mint(to);
+
         if (msg.value > amountNative) {
-            (bool refundOk, ) = msg.sender.call{value: msg.value - amountNative}("");
-            require(refundOk, "Paragon: REFUND_FAIL");
+            (bool success, ) = msg.sender.call{value: msg.value - amountNative}("");
+            require(success, "Paragon: REFUND_FAIL");
         }
     }
 
@@ -456,6 +573,13 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         nonReentrant
         returns (uint amountA, uint amountB)
     {
+        _enforceWhitelist();
+
+        address[] memory path = new address[](2);
+        path[0] = tokenA;
+        path[1] = tokenB;
+        _enforceXpgnNotPaused(path);
+
         address pair = ParagonLibrary.pairFor(factory, tokenA, tokenB);
         IERC20(pair).safeTransferFrom(msg.sender, pair, liquidity);
         (uint amount0, uint amount1) = IParagonPair(pair).burn(to);
@@ -480,6 +604,13 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         nonReentrant
         returns (uint amountToken, uint amountNative)
     {
+        _enforceWhitelist();
+
+        address[] memory path = new address[](2);
+        path[0] = token;
+        path[1] = WNative;
+        _enforceXpgnNotPaused(path);
+
         address pair = ParagonLibrary.pairFor(factory, token, WNative);
         IERC20(pair).safeTransferFrom(msg.sender, pair, liquidity);
         (uint amount0, uint amount1) = IParagonPair(pair).burn(address(this));
@@ -489,8 +620,8 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         require(outWNative >= amountNativeMin, "Paragon: INSUFF_NATIVE");
         IERC20(token).safeTransfer(to, outToken);
         IWETH(WNative).withdraw(outWNative);
-        (bool sendOk, ) = to.call{value: outWNative}("");
-        require(sendOk, "Paragon: NATIVE_SEND_FAIL");
+        (bool success, ) = to.call{value: outWNative}("");
+        require(success, "Paragon: NATIVE_SEND_FAIL");
         return (outToken, outWNative);
     }
 
@@ -547,7 +678,7 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         return removeLiquidityNative(token, liquidity, amountTokenMin, amountNativeMin, to, deadline);
     }
 
-    // ---------------------- Swaps (exact-in/out) ----------------------
+    // ---------------------- Swaps (classic) ----------------------
     function swapExactTokensForTokens(
         uint amountIn,
         uint amountOutMin,
@@ -561,25 +692,40 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint[] memory amts)
+        returns (uint[] memory amounts)
     {
+        _enforceWhitelist();
+
         address[] memory r = path;
         _checkPath(r);
-        amts = ParagonLibrary.getAmountsOut(factory, amountIn, r);
-
-        // Unified oracle + impact guard for exact-in tokens->tokens
-        _enforceOracleGuard(amountIn, r, amts[amts.length - 1]);
-
-        require(amts[amts.length - 1] >= amountOutMin, "Paragon: INSUFF_OUTPUT");
-        IERC20(r[0]).safeTransferFrom(
-            msg.sender,
-            ParagonLibrary.pairFor(factory, r[0], r[1]),
-            amts[0]
-        );
-        ParagonRouterSwapHelper.swap(amts, r, factory, address(this));
+        _enforceXpgnNotPaused(r);
 
         uint8 eff = _effectiveAutoYieldPercent(msg.sender, to, autoYieldPercent);
-        _handleAutoYield(r[r.length - 1], amts[amts.length - 1], to, eff);
+        address outToken = r[r.length - 1];
+
+        bool custody = _shouldCustodyForAutoYield(outToken, eff);
+        address finalTo = custody ? address(this) : to;
+
+        uint256 grossMin = custody ? _minGrossOutForNet(amountOutMin, eff) : amountOutMin;
+
+        amounts = ParagonLibrary.getAmountsOut(factory, amountIn, r);
+
+        _enforceOracleGuard(amountIn, r, amounts[amounts.length - 1]);
+
+        require(amounts[amounts.length - 1] >= grossMin, "Paragon: INSUFF_OUTPUT");
+
+        IERC20(r[0]).safeTransferFrom(msg.sender, ParagonLibrary.pairFor(factory, r[0], r[1]), amountIn);
+
+        ParagonRouterSwapHelper.swap(amounts, r, factory, finalTo);
+
+        if (custody) {
+            uint256 userBefore = IERC20(outToken).balanceOf(to);
+            _handleAutoYield(outToken, amounts[amounts.length - 1], to, eff);
+            uint256 userReceived = IERC20(outToken).balanceOf(to) - userBefore;
+            require(userReceived >= amountOutMin, "Paragon: INSUFF_USER_OUT");
+        }
+
+        return amounts;
     }
 
     function swapTokensForExactTokens(
@@ -594,18 +740,25 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint[] memory amts)
+        returns (uint[] memory amounts)
     {
+        _enforceWhitelist();
+
         address[] memory r = path;
         _checkPath(r);
-        amts = ParagonLibrary.getAmountsIn(factory, amountOut, r);
-        require(amts[0] <= amountInMax, "Paragon: EXCESSIVE_INPUT");
-        IERC20(r[0]).safeTransferFrom(
-            msg.sender,
-            ParagonLibrary.pairFor(factory, r[0], r[1]),
-            amts[0]
-        );
-        ParagonRouterSwapHelper.swap(amts, r, factory, to);
+        _enforceXpgnNotPaused(r);
+
+        amounts = ParagonLibrary.getAmountsIn(factory, amountOut, r);
+
+        _enforceOracleGuard(amounts[0], r, amountOut);
+
+        require(amounts[0] <= amountInMax, "Paragon: EXCESSIVE_INPUT");
+
+        IERC20(r[0]).safeTransferFrom(msg.sender, ParagonLibrary.pairFor(factory, r[0], r[1]), amounts[0]);
+
+        ParagonRouterSwapHelper.swap(amounts, r, factory, to);
+
+        return amounts;
     }
 
     function swapExactNativeForTokens(
@@ -621,33 +774,83 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint[] memory amts)
+        returns (uint[] memory amounts)
     {
+        _enforceWhitelist();
+
         require(path[0] == WNative, "Paragon: PATH_START_WNATIVE");
+
         address[] memory r = path;
         _checkPath(r);
-        amts = ParagonLibrary.getAmountsOut(factory, msg.value, r);
-
-        // Unified oracle + impact guard for exact-in native->tokens
-        _enforceOracleGuard(amts[0], r, amts[amts.length - 1]);
-
-        require(amts[amts.length - 1] >= amountOutMin, "Paragon: INSUFF_OUTPUT");
-        IWETH(WNative).deposit{value: amts[0]}();
-        assert(
-            IWETH(WNative).transfer(
-                ParagonLibrary.pairFor(factory, r[0], r[1]),
-                amts[0]
-            )
-        );
-        ParagonRouterSwapHelper.swap(amts, r, factory, address(this));
+        _enforceXpgnNotPaused(r);
 
         uint8 eff = _effectiveAutoYieldPercent(msg.sender, to, autoYieldPercent);
-        _handleAutoYield(r[r.length - 1], amts[amts.length - 1], to, eff);
+        address outToken = r[r.length - 1];
 
-        if (msg.value > amts[0]) {
-            (bool refundOk, ) = msg.sender.call{value: msg.value - amts[0]}("");
-            require(refundOk, "Paragon: REFUND_FAIL");
+        bool custody = _shouldCustodyForAutoYield(outToken, eff);
+        address finalTo = custody ? address(this) : to;
+
+        uint256 grossMin = custody ? _minGrossOutForNet(amountOutMin, eff) : amountOutMin;
+
+        amounts = ParagonLibrary.getAmountsOut(factory, msg.value, r);
+
+        _enforceOracleGuard(msg.value, r, amounts[amounts.length - 1]);
+
+        require(amounts[amounts.length - 1] >= grossMin, "Paragon: INSUFF_OUTPUT");
+
+        IWETH(WNative).deposit{value: msg.value}();
+        assert(IWETH(WNative).transfer(ParagonLibrary.pairFor(factory, r[0], r[1]), msg.value));
+
+        ParagonRouterSwapHelper.swap(amounts, r, factory, finalTo);
+
+        if (custody) {
+            uint256 userBefore = IERC20(outToken).balanceOf(to);
+            _handleAutoYield(outToken, amounts[amounts.length - 1], to, eff);
+            uint256 userReceived = IERC20(outToken).balanceOf(to) - userBefore;
+            require(userReceived >= amountOutMin, "Paragon: INSUFF_USER_OUT");
         }
+
+        return amounts;
+    }
+
+    function swapExactTokensForNative(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    )
+        external
+        override
+        ensure(deadline)
+        whenNotPaused
+        nonReentrant
+        returns (uint[] memory amounts)
+    {
+        _enforceWhitelist();
+
+        require(path[path.length - 1] == WNative, "Paragon: PATH_END_WNATIVE");
+
+        address[] memory r = path;
+        _checkPath(r);
+        _enforceXpgnNotPaused(r);
+
+        amounts = ParagonLibrary.getAmountsOut(factory, amountIn, r);
+
+        _enforceOracleGuard(amountIn, r, amounts[amounts.length - 1]);
+
+        require(amounts[amounts.length - 1] >= amountOutMin, "Paragon: INSUFF_OUTPUT");
+
+        IERC20(r[0]).safeTransferFrom(msg.sender, ParagonLibrary.pairFor(factory, r[0], r[1]), amountIn);
+
+        ParagonRouterSwapHelper.swap(amounts, r, factory, address(this));
+
+        uint256 wOut = amounts[amounts.length - 1];
+        IWETH(WNative).withdraw(wOut);
+        (bool success, ) = to.call{value: wOut}("");
+        require(success, "Paragon: NATIVE_SEND_FAIL");
+
+        return amounts;
     }
 
     function swapTokensForExactNative(
@@ -662,26 +865,31 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint[] memory amts)
+        returns (uint[] memory amounts)
     {
+        _enforceWhitelist();
+
         require(path[path.length - 1] == WNative, "Paragon: PATH_END_WNATIVE");
+
         address[] memory r = path;
         _checkPath(r);
-        amts = ParagonLibrary.getAmountsIn(factory, amountOut, r);
-        require(amts[0] <= amountInMax, "Paragon: EXCESSIVE_INPUT");
-        IERC20(r[0]).safeTransferFrom(
-            msg.sender,
-            ParagonLibrary.pairFor(factory, r[0], r[1]),
-            amts[0]
-        );
-        ParagonRouterSwapHelper.swap(amts, r, factory, address(this));
+        _enforceXpgnNotPaused(r);
 
-        // Unified oracle + impact guard for tokens->native path using exact-in estimate
-        _enforceOracleGuard(amts[0], r, amts[amts.length - 1]);
+        amounts = ParagonLibrary.getAmountsIn(factory, amountOut, r);
 
-        IWETH(WNative).withdraw(amts[amts.length - 1]);
-        (bool sendOk, ) = to.call{value: amts[amts.length - 1]}("");
-        require(sendOk, "Paragon: NATIVE_SEND_FAIL");
+        _enforceOracleGuard(amounts[0], r, amountOut);
+
+        require(amounts[0] <= amountInMax, "Paragon: EXCESSIVE_INPUT");
+
+        IERC20(r[0]).safeTransferFrom(msg.sender, ParagonLibrary.pairFor(factory, r[0], r[1]), amounts[0]);
+
+        ParagonRouterSwapHelper.swap(amounts, r, factory, address(this));
+
+        IWETH(WNative).withdraw(amountOut);
+        (bool success, ) = to.call{value: amountOut}("");
+        require(success, "Paragon: NATIVE_SEND_FAIL");
+
+        return amounts;
     }
 
     function swapNativeForExactTokens(
@@ -696,25 +904,33 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint[] memory amts)
+        returns (uint[] memory amounts)
     {
+        _enforceWhitelist();
+
         require(path[0] == WNative, "Paragon: PATH_START_WNATIVE");
+
         address[] memory r = path;
         _checkPath(r);
-        amts = ParagonLibrary.getAmountsIn(factory, amountOut, r);
-        require(amts[0] <= msg.value, "Paragon: EXCESSIVE_INPUT");
-        IWETH(WNative).deposit{value: amts[0]}();
-        assert(
-            IWETH(WNative).transfer(
-                ParagonLibrary.pairFor(factory, r[0], r[1]),
-                amts[0]
-            )
-        );
-        ParagonRouterSwapHelper.swap(amts, r, factory, to);
-        if (msg.value > amts[0]) {
-            (bool refundOk, ) = msg.sender.call{value: msg.value - amts[0]}("");
-            require(refundOk, "Paragon: REFUND_FAIL");
+        _enforceXpgnNotPaused(r);
+
+        amounts = ParagonLibrary.getAmountsIn(factory, amountOut, r);
+
+        _enforceOracleGuard(amounts[0], r, amountOut);
+
+        require(amounts[0] <= msg.value, "Paragon: EXCESSIVE_INPUT");
+
+        IWETH(WNative).deposit{value: amounts[0]}();
+        assert(IWETH(WNative).transfer(ParagonLibrary.pairFor(factory, r[0], r[1]), amounts[0]));
+
+        ParagonRouterSwapHelper.swap(amounts, r, factory, to);
+
+        if (msg.value > amounts[0]) {
+            (bool success, ) = msg.sender.call{value: msg.value - amounts[0]}("");
+            require(success, "Paragon: REFUND_FAIL");
         }
+
+        return amounts;
     }
 
     // ---------------------- FOT Support (exact-in) ----------------------
@@ -731,47 +947,50 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint outAmt)
+        returns (uint amountOut)
     {
+        _enforceWhitelist();
+
         address[] memory r = path;
         _checkPath(r);
-
-        IERC20(r[0]).safeTransferFrom(
-            msg.sender,
-            ParagonLibrary.pairFor(factory, r[0], r[1]),
-            amountIn
-        );
-
-        address outToken = r[r.length - 1];
-        uint256 beforeBal = IERC20(outToken).balanceOf(address(this));
-
-        ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(
-            r,
-            factory,
-            address(this)
-        );
-
-        outAmt = IERC20(outToken).balanceOf(address(this)) - beforeBal;
-
-        if (guardEnabled && _pathHasProtected(r)) {
-            (uint minOut, bool oracleOk) = _oracleMinOutMaybe(amountIn, r);
-            if (failOpen) {
-                if (oracleOk && minOut > 0) {
-                    require(outAmt >= minOut, "Paragon: ORACLE_SLIPPAGE");
-                }
-            } else {
-                require(oracleOk && minOut > 0, "Paragon: ORACLE_FAIL");
-                require(outAmt >= minOut, "Paragon: ORACLE_SLIPPAGE");
-            }
-            uint[] memory amtsChk = ParagonLibrary.getAmountsOut(factory, amountIn, r);
-            uint16 impact = _impactBips(amountIn, r, amtsChk);
-            require(impact <= maxImpactBips, "Paragon: PRICE_IMPACT");
-        }
-
-        require(outAmt >= amountOutMin, "Paragon: INSUFF_OUTPUT");
+        _enforceXpgnNotPaused(r);
 
         uint8 eff = _effectiveAutoYieldPercent(msg.sender, to, autoYieldPercent);
-        _handleAutoYield(outToken, outAmt, to, eff);
+        address outToken = r[r.length - 1];
+
+        bool custody = _shouldCustodyForAutoYield(outToken, eff);
+        address finalTo = custody ? address(this) : to;
+
+        uint256 grossMin = custody ? _minGrossOutForNet(amountOutMin, eff) : amountOutMin;
+
+        address inputToken = r[0];
+        address firstPair = ParagonLibrary.pairFor(factory, inputToken, r[1]);
+        uint256 balanceBefore = IERC20(inputToken).balanceOf(firstPair);
+
+        IERC20(inputToken).safeTransferFrom(msg.sender, firstPair, amountIn);
+
+        uint256 actualIn = IERC20(inputToken).balanceOf(firstPair) - balanceBefore;
+
+        _enforceFOTTolerance(amountIn, actualIn);
+
+        uint256 beforeBal = IERC20(outToken).balanceOf(finalTo);
+
+        ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(r, factory, finalTo);
+
+        amountOut = IERC20(outToken).balanceOf(finalTo) - beforeBal;
+
+        _enforceOracleGuardPostSwap(actualIn, r, amountOut);
+
+        require(amountOut >= grossMin, "Paragon: INSUFF_OUTPUT");
+
+        if (custody) {
+            uint256 userBefore = IERC20(outToken).balanceOf(to);
+            _handleAutoYield(outToken, amountOut, to, eff);
+            uint256 userReceived = IERC20(outToken).balanceOf(to) - userBefore;
+            require(userReceived >= amountOutMin, "Paragon: INSUFF_USER_OUT");
+        }
+
+        return amountOut;
     }
 
     function swapExactNativeForTokensSupportingFeeOnTransferTokens(
@@ -787,50 +1006,53 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint outAmt)
+        returns (uint amountOut)
     {
+        _enforceWhitelist();
+
         require(path[0] == WNative, "Paragon: PATH_START_WNATIVE");
+
         address[] memory r = path;
         _checkPath(r);
-
-        IWETH(WNative).deposit{value: msg.value}();
-        assert(
-            IWETH(WNative).transfer(
-                ParagonLibrary.pairFor(factory, r[0], r[1]),
-                msg.value
-            )
-        );
-
-        address outToken = r[r.length - 1];
-        uint256 beforeBal = IERC20(outToken).balanceOf(address(this));
-
-        ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(
-            r,
-            factory,
-            address(this)
-        );
-
-        outAmt = IERC20(outToken).balanceOf(address(this)) - beforeBal;
-
-        if (guardEnabled && _pathHasProtected(r)) {
-            (uint minOut, bool oracleOk) = _oracleMinOutMaybe(msg.value, r);
-            if (failOpen) {
-                if (oracleOk && minOut > 0) {
-                    require(outAmt >= minOut, "Paragon: ORACLE_SLIPPAGE");
-                }
-            } else {
-                require(oracleOk && minOut > 0, "Paragon: ORACLE_FAIL");
-                require(outAmt >= minOut, "Paragon: ORACLE_SLIPPAGE");
-            }
-            uint[] memory amtsChk = ParagonLibrary.getAmountsOut(factory, msg.value, r);
-            uint16 impact = _impactBips(msg.value, r, amtsChk);
-            require(impact <= maxImpactBips, "Paragon: PRICE_IMPACT");
-        }
-
-        require(outAmt >= amountOutMin, "Paragon: INSUFF_OUTPUT");
+        _enforceXpgnNotPaused(r);
 
         uint8 eff = _effectiveAutoYieldPercent(msg.sender, to, autoYieldPercent);
-        _handleAutoYield(outToken, outAmt, to, eff);
+        address outToken = r[r.length - 1];
+
+        bool custody = _shouldCustodyForAutoYield(outToken, eff);
+        address finalTo = custody ? address(this) : to;
+
+        uint256 grossMin = custody ? _minGrossOutForNet(amountOutMin, eff) : amountOutMin;
+
+        IWETH(WNative).deposit{value: msg.value}();
+
+        address firstPair = ParagonLibrary.pairFor(factory, r[0], r[1]);
+        uint256 balanceBefore = IERC20(WNative).balanceOf(firstPair);
+
+        assert(IWETH(WNative).transfer(firstPair, msg.value));
+
+        uint256 actualIn = IERC20(WNative).balanceOf(firstPair) - balanceBefore;
+
+        _enforceFOTTolerance(msg.value, actualIn);
+
+        uint256 beforeBal = IERC20(outToken).balanceOf(finalTo);
+
+        ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(r, factory, finalTo);
+
+        amountOut = IERC20(outToken).balanceOf(finalTo) - beforeBal;
+
+        _enforceOracleGuardPostSwap(actualIn, r, amountOut);
+
+        require(amountOut >= grossMin, "Paragon: INSUFF_OUTPUT");
+
+        if (custody) {
+            uint256 userBefore = IERC20(outToken).balanceOf(to);
+            _handleAutoYield(outToken, amountOut, to, eff);
+            uint256 userReceived = IERC20(outToken).balanceOf(to) - userBefore;
+            require(userReceived >= amountOutMin, "Paragon: INSUFF_USER_OUT");
+        }
+
+        return amountOut;
     }
 
     function swapExactTokensForNativeSupportingFeeOnTransferTokens(
@@ -845,48 +1067,43 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         ensure(deadline)
         whenNotPaused
         nonReentrant
-        returns (uint outAmt)
+        returns (uint amountOut)
     {
+        _enforceWhitelist();
+
         require(path[path.length - 1] == WNative, "Paragon: PATH_END_WNATIVE");
 
         address[] memory r = path;
         _checkPath(r);
+        _enforceXpgnNotPaused(r);
 
-        IERC20(r[0]).safeTransferFrom(
-            msg.sender,
-            ParagonLibrary.pairFor(factory, r[0], r[1]),
-            amountIn
-        );
+        address inputToken = r[0];
+        address firstPair = ParagonLibrary.pairFor(factory, inputToken, r[1]);
+        uint256 balanceBefore = IERC20(inputToken).balanceOf(firstPair);
+
+        IERC20(inputToken).safeTransferFrom(msg.sender, firstPair, amountIn);
+
+        uint256 actualIn = IERC20(inputToken).balanceOf(firstPair) - balanceBefore;
+
+        _enforceFOTTolerance(amountIn, actualIn);
 
         uint256 beforeBal = IERC20(WNative).balanceOf(address(this));
-        ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(
-            r,
-            factory,
-            address(this)
-        );
+
+        ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(r, factory, address(this));
+
         uint256 wReceived = IERC20(WNative).balanceOf(address(this)) - beforeBal;
 
-        if (guardEnabled && _pathHasProtected(r)) {
-            (uint minOut, bool oracleOk) = _oracleMinOutMaybe(amountIn, r);
-            if (failOpen) {
-                if (oracleOk && minOut > 0) {
-                    require(wReceived >= minOut, "Paragon: ORACLE_SLIPPAGE");
-                }
-            } else {
-                require(oracleOk && minOut > 0, "Paragon: ORACLE_FAIL");
-                require(wReceived >= minOut, "Paragon: ORACLE_SLIPPAGE");
-            }
-            uint[] memory amtsChk = ParagonLibrary.getAmountsOut(factory, amountIn, r);
-            uint16 impact = _impactBips(amountIn, r, amtsChk);
-            require(impact <= maxImpactBips, "Paragon: PRICE_IMPACT");
-        }
+        _enforceOracleGuardPostSwap(actualIn, r, wReceived);
 
         require(wReceived >= amountOutMin, "Paragon: INSUFF_OUTPUT");
-        IWETH(WNative).withdraw(wReceived);
-        (bool sendOk, ) = to.call{value: wReceived}("");
-        require(sendOk, "Paragon: NATIVE_SEND_FAIL");
 
-        outAmt = wReceived;
+        IWETH(WNative).withdraw(wReceived);
+        (bool success, ) = to.call{value: wReceived}("");
+        require(success, "Paragon: NATIVE_SEND_FAIL");
+
+        amountOut = wReceived;
+
+        return amountOut;
     }
 
     // ---------------------- Admin: pause/rescue ----------------------
@@ -900,8 +1117,8 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
 
     function rescueTokens(address token, address to) external onlyOwner {
         if (token == address(0)) {
-            (bool sendOk, ) = to.call{value: address(this).balance}("");
-            require(sendOk, "Paragon: NATIVE_SEND_FAIL");
+            (bool success, ) = to.call{value: address(this).balance}("");
+            require(success, "Paragon: NATIVE_SEND_FAIL");
         } else {
             IERC20(token).safeTransfer(to, IERC20(token).balanceOf(address(this)));
         }

@@ -14,12 +14,13 @@ async function latestTs() {
   return b.timestamp;
 }
 
-describe("RewardDripperEscrow / MockDripper @spec", () => {
-  let owner, farm, other;
+describe("RewardDripperEscrow @spec (hardened)", () => {
+  let owner, other;
   let X, dripper;
+  let farmMock; // IMPORTANT: must be a contract exposing rewardToken()
 
   beforeEach(async () => {
-    [owner, farm, other] = await ethers.getSigners();
+    [owner, , other] = await ethers.getSigners();
 
     // Token
     const ERC = await ethers.getContractFactory("contracts/mocks/MockERC20.sol:MockERC20");
@@ -27,13 +28,17 @@ describe("RewardDripperEscrow / MockDripper @spec", () => {
     await X.waitForDeployment();
     await X.mint(owner.address, E("1000000"));
 
-    // Dripper (MockDripper)
-    const D = await ethers.getContractFactory("MockDripper");
-    try {
-      dripper = await D.deploy(X.target, farm.address, owner.address); // OZ v5 Ownable(_owner)
-    } catch {
-      dripper = await D.deploy(X.target, farm.address);
-    }
+    // Farm mock (implements rewardToken() via public immutable)
+    const FarmMock = await ethers.getContractFactory("MockFarmRewards");
+    farmMock = await FarmMock.deploy(X.target);
+    await farmMock.waitForDeployment();
+
+    // Hardened escrow
+    const D = await ethers.getContractFactory("RewardDripperEscrow");
+
+    // ctor: (owner_, token_, farm_, startTime_, ratePerSec_)
+    const nowTs = await latestTs();
+    dripper = await D.deploy(owner.address, X.target, await farmMock.getAddress(), nowTs, 0);
     await dripper.waitForDeployment();
 
     await X.connect(owner).approve(dripper.target, ethers.MaxUint256);
@@ -102,34 +107,31 @@ describe("RewardDripperEscrow / MockDripper @spec", () => {
     expect(a2).to.be.gt(a1);
 
     await dripper.fund(E("1000"));
-    const farmBefore = await X.balanceOf(farm.address);
+
+    const farmAddr = await farmMock.getAddress();
+    const farmBefore = await X.balanceOf(farmAddr);
 
     const tx = await dripper.drip();
     const rcpt = await tx.wait();
-    const [ev] = await dripper.queryFilter(
-      dripper.filters.Dripped(),
-      rcpt.blockNumber,
-      rcpt.blockNumber
-    );
+    const [ev] = await dripper.queryFilter(dripper.filters.Dripped(), rcpt.blockNumber, rcpt.blockNumber);
     const [accruedBefore, sent, accruedAfter] = ev.args.map((x) => BigInt(x));
 
-    // exact conservation from event values (no timing drift)
     expect(accruedAfter).to.equal(accruedBefore - sent);
 
-    const farmAfter = await X.balanceOf(farm.address);
+    const farmAfter = await X.balanceOf(farmAddr);
     expect(farmAfter - farmBefore).to.equal(sent);
   });
 
   /* ───────── INV-RDE-04: rate changes apply accrual first ───────── */
   it("INV-RDE-04: setRatePerSec / setWeeklyAmount apply accrual first", async () => {
-    await dripper.setRatePerSec(E("10")); // r0
+    await dripper.setRatePerSec(E("10"));
     await ff(30);
 
     const tBefore = await latestTs();
     const pendingBefore = await dripper.pendingAccrued();
     const oldRate = await dripper.currentRatePerSec();
 
-    await dripper.setRatePerSec(E("20")); // accrues to now first
+    await dripper.setRatePerSec(E("20"));
 
     const tAfter = await latestTs();
     const accruedAfter = await dripper.accrued();
@@ -146,53 +148,60 @@ describe("RewardDripperEscrow / MockDripper @spec", () => {
   it("INV-RDE-05: drip() sends min(accrued, balance, maxDripPerTx)", async () => {
     await dripper.setRatePerSec(E("1"));
     await ff(500); // ~500 accrued
-    const mintedToDripper = E("300");
-    await dripper.fund(mintedToDripper); // balance 300
+
+    const funded = E("300");
+    await dripper.fund(funded); // balance 300
+
     const cap = E("200");
     await dripper.setMaxDripPerTx(cap); // cap 200
 
-    const farmBefore = await X.balanceOf(farm.address);
+    const farmAddr = await farmMock.getAddress();
+    const farmBefore = await X.balanceOf(farmAddr);
 
     const tx = await dripper.drip();
     const rcpt = await tx.wait();
-    const [ev] = await dripper.queryFilter(
-      dripper.filters.Dripped(),
-      rcpt.blockNumber,
-      rcpt.blockNumber
-    );
+    const [ev] = await dripper.queryFilter(dripper.filters.Dripped(), rcpt.blockNumber, rcpt.blockNumber);
     const [accruedBefore, sent, accruedAfter] = ev.args.map((x) => BigInt(x));
 
-    const expectedSent = (accruedBefore < mintedToDripper
+    const expectedSent = (accruedBefore < funded
       ? (accruedBefore < cap ? accruedBefore : cap)
-      : (mintedToDripper < cap ? mintedToDripper : cap));
+      : (funded < cap ? funded : cap));
 
     expect(sent).to.equal(expectedSent);
     expect(accruedAfter).to.equal(accruedBefore - sent);
 
-    const farmAfter = await X.balanceOf(farm.address);
+    const farmAfter = await X.balanceOf(farmAddr);
     expect(farmAfter - farmBefore).to.equal(sent);
   });
 
-  /* ───────── INV-RDE-07: pull model & setFarm allowances ───────── */
-  it("INV-RDE-07: pull model toggles allowance; setFarm rewires allowance", async () => {
-    expect(await X.allowance(dripper.target, farm.address)).to.equal(0n);
+  /* ───────── NEW: underfunded drip skips without reverting ───────── */
+  it("HANDSHAKE: skips without reverting when dripper is underfunded", async () => {
+    await dripper.setRatePerSec(E("1"));
+    await ff(100);
 
-    await dripper.setFarmPullEnabled(true);
-    expect(await X.allowance(dripper.target, farm.address)).to.equal(ethers.MaxUint256);
+    const pending = await dripper.pendingAccrued();
+    expect(pending).to.be.gt(0n);
 
-    const newFarm = other.address;
-    await dripper.setFarm(newFarm);
-    expect(await X.allowance(dripper.target, farm.address)).to.equal(0n);
-    expect(await X.allowance(dripper.target, newFarm)).to.equal(ethers.MaxUint256);
+    // no fund() called => balance is 0
+    const farmAddr = await farmMock.getAddress();
+    const farmBefore = await X.balanceOf(farmAddr);
 
-    await dripper.setFarmPullEnabled(false);
-    expect(await X.allowance(dripper.target, newFarm)).to.equal(0n);
+    const tx = await dripper.drip();
+    const rcpt = await tx.wait();
+
+    const [ev] = await dripper.queryFilter(dripper.filters.Dripped(), rcpt.blockNumber, rcpt.blockNumber);
+    const sent = BigInt(ev.args.sent);
+    expect(sent).to.equal(0n);
+
+    const farmAfter = await X.balanceOf(farmAddr);
+    expect(farmAfter - farmBefore).to.equal(0n);
   });
 
   /* ───────── INV-RDE-08: clearSchedule keeps rate/accrued intact ───────── */
   it("INV-RDE-08: clearSchedule removes only future schedule; no rate/accrued change", async () => {
     await dripper.setRatePerSec(E("3"));
     await ff(11);
+
     const accBefore = await dripper.accrued();
     const rateBefore = await dripper.currentRatePerSec();
 
@@ -210,27 +219,33 @@ describe("RewardDripperEscrow / MockDripper @spec", () => {
 
   /* ───────── INV-RDE-09: zero guards & rescue ───────── */
   it("INV-RDE-09: zero guards & rescue()", async () => {
-    // constructor zero guards
-    const D = await ethers.getContractFactory("MockDripper");
-    await expect(D.deploy(ethers.ZeroAddress, farm.address, owner.address)).to.be.revertedWith("Escrow: zero").catch(() => {});
-    await expect(D.deploy(X.target, ethers.ZeroAddress, owner.address)).to.be.revertedWith("Escrow: zero farm").catch(() => {});
+    const D = await ethers.getContractFactory("RewardDripperEscrow");
+    const nowTs = await latestTs();
+    const farmAddr = await farmMock.getAddress();
 
-    // setFarm zero
+    // OZ v5 Ownable(owner_) reverts with custom error before your require() string
+    await expect(
+      D.deploy(ethers.ZeroAddress, X.target, farmAddr, nowTs, 0)
+    ).to.be.revertedWithCustomError(D, "OwnableInvalidOwner");
+
+    await expect(D.deploy(owner.address, ethers.ZeroAddress, farmAddr, nowTs, 0)).to.be.revertedWith("Escrow: zero token");
+    await expect(D.deploy(owner.address, X.target, ethers.ZeroAddress, nowTs, 0)).to.be.revertedWith("Escrow: zero farm");
+
     await expect(dripper.setFarm(ethers.ZeroAddress)).to.be.revertedWith("Escrow: zero farm");
+    await expect(dripper.setMaxDripPerTx(0)).to.be.revertedWith("Escrow: zero max");
 
-    // setMaxDripPerTx > 0 (string revert in mock)
-    await expect(dripper.setMaxDripPerTx(0)).to.be.revertedWith("Escrow: max=0");
+    await expect(dripper.rescue(X.target, ethers.ZeroAddress, 1)).to.be.revertedWith("Escrow: zero to");
+    await expect(dripper.rescue(X.target, other.address, 0)).to.be.revertedWith("Escrow: zero amount");
 
-    // rescue(to=0)
-    await expect(dripper.rescue(X.target, ethers.ZeroAddress)).to.be.revertedWith("Escrow: zero to");
-
-    // rescue other token works
+    // rescue other token works (3-arg rescue)
     const ERC = await ethers.getContractFactory("contracts/mocks/MockERC20.sol:MockERC20");
     const O = await ERC.deploy("OTK", "OTK", 18);
     await O.waitForDeployment();
+
     await O.mint(dripper.target, E("123"));
+
     const before = await O.balanceOf(other.address);
-    await dripper.rescue(O.target, other.address);
+    await dripper.rescue(O.target, other.address, E("123"));
     expect((await O.balanceOf(other.address)) - before).to.equal(E("123"));
   });
 
@@ -240,22 +255,18 @@ describe("RewardDripperEscrow / MockDripper @spec", () => {
     await ff(10); // ~20 accrued
     await dripper.fund(E("100"));
 
-    const farmBefore = await X.balanceOf(farm.address);
+    const farmAddr = await farmMock.getAddress();
+    const farmBefore = await X.balanceOf(farmAddr);
 
     const tx = await dripper.drip();
     const rcpt = await tx.wait();
-    const [ev] = await dripper.queryFilter(
-      dripper.filters.Dripped(),
-      rcpt.blockNumber,
-      rcpt.blockNumber
-    );
+    const [ev] = await dripper.queryFilter(dripper.filters.Dripped(), rcpt.blockNumber, rcpt.blockNumber);
     const [accruedBefore, sent, accruedAfter] = ev.args.map((x) => BigInt(x));
 
-    // With cap at default (max) and balance sufficient, we send full accrued
     expect(accruedAfter).to.equal(accruedBefore - sent);
     expect(accruedAfter).to.equal(0n);
 
-    const farmAfter = await X.balanceOf(farm.address);
+    const farmAfter = await X.balanceOf(farmAddr);
     expect(farmAfter - farmBefore).to.equal(sent);
   });
 });

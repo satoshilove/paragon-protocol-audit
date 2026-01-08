@@ -2,9 +2,9 @@
 pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import { IUsdValuer } from "../interfaces/IUsdValuer.sol"; // ← add interface import
+import { IUsdValuer } from "./interfaces/IUsdValuer.sol"; // ← add interface import
 
 interface IAggregatorV3 {
     function latestRoundData() external view returns (

@@ -250,8 +250,10 @@ describe("ParagonFarmController (final, dynamic-enabled)", function () {
     const userBefore = await farm.userInfo(0, alice.address);
     const firstTime = userBefore.lastDepositTime;
 
-    // set router and fund it
-    await (await farm.setAutoYieldRouter(autoRouter.address)).wait();
+    // ✅ UPDATED: authorize autoRouter as AutoYield caller (replaces setAutoYieldRouter)
+    await (await farm.setAutoYieldCaller(autoRouter.address, true)).wait();
+
+    // fund it + approve
     await (await reward.mint(autoRouter.address, E("5"))).wait();
     await (await reward.connect(autoRouter).approve(farm.target, ethers.MaxUint256)).wait();
 
