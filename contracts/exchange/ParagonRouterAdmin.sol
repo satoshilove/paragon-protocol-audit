@@ -5,7 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "./interfaces/IParagonFactory.sol";
 import "./libraries/ParagonLibrary.sol";
 
-/// @dev minimal paused() interface (avoid hard-importing token contract)
+/// @dev Minimal paused() interface (avoid hard-importing token contract)
 interface IPausableToken {
     function paused() external view returns (bool);
 }
@@ -25,7 +25,7 @@ contract ParagonRouterAdmin is Ownable {
     bool public whitelistEnabled;
     mapping(address => bool) public whitelist;
 
-    // XPGN token address is read from the Factory (no hardcoded address)
+    // Events
     event SlippageUpdated(uint32 bips);
     event PriceImpactUpdated(uint32 bips);
     event FeeToleranceUpdated(uint32 tolerance);
@@ -53,7 +53,6 @@ contract ParagonRouterAdmin is Ownable {
     }
 
     function setFeeOnTransferTolerance(uint32 _tolerance) external onlyOwner {
-        // keep tight: <= 10% default cap (adjust if you want)
         require(_tolerance <= 1_000, "INVALID_TOLERANCE");
         feeOnTransferTolerance = _tolerance;
         emit FeeToleranceUpdated(_tolerance);
@@ -69,9 +68,7 @@ contract ParagonRouterAdmin is Ownable {
         if (_enabled) {
             require(_oracle != address(0), "ZERO_ORACLE");
             uint256 size;
-            assembly {
-                size := extcodesize(_oracle)
-            }
+            assembly { size := extcodesize(_oracle) }
             require(size > 0, "INVALID_ORACLE");
         }
         twapOracle = _oracle;
@@ -109,6 +106,20 @@ contract ParagonRouterAdmin is Ownable {
     }
 
     // ==========================
+    // Internal fee helper (PAD-34 fix)
+    // ==========================
+    /// @dev Returns the effective swap fee for a specific hop (tokenA->tokenB),
+    /// honoring per-pair overrides via factory.getEffectiveSwapFeeBips(pair).
+    function _effectiveFeeBipsForHop(address factory, address tokenA, address tokenB) internal view returns (uint32) {
+        address pair = IParagonFactory(factory).getPair(tokenA, tokenB);
+        if (pair == address(0)) {
+            // No pair - fall back to global for estimation (liquidity checks will fail anyway)
+            return IParagonFactory(factory).swapFeeBips();
+        }
+        return IParagonFactory(factory).getEffectiveSwapFeeBips(pair);
+    }
+
+    // ==========================
     // Validation helpers (optional UI calls)
     // ==========================
 
@@ -134,43 +145,48 @@ contract ParagonRouterAdmin is Ownable {
         }
     }
 
-    /// @notice Conservative multi-hop impact check (linear approx, matches router-style guard)
+    /// @notice Multi-hop price impact check using improved approximation
+    /// Uses ×2 factor: ≈ 2 × amountIn / (reserveIn + amountIn) for marginal impact
+    /// PAD-34 FIX: uses per-hop effective fee (honors per-pair overrides)
     function checkPriceImpactMultiHop(address factory, uint amountIn, address[] calldata path) external view {
         require(path.length >= 2, "INVALID_PATH");
 
         uint currentIn = amountIn;
-        uint32 swapFeeBips = IParagonFactory(factory).swapFeeBips();
         uint32 maxImpact = maxPriceImpactBips;
 
         for (uint i; i < path.length - 1; ) {
             (uint112 reserveA, uint112 reserveB, ) = ParagonLibrary.getReserves(factory, path[i], path[i + 1]);
             require(reserveA > 0 && reserveB > 0, "INSUFFICIENT_LIQUIDITY");
 
-            // approx impact = in / (reserveIn + in)
-            uint256 impact = (currentIn * 10_000) / (uint(reserveA) + currentIn);
+            // Improved: marginal impact ≈ 2 * currentIn / (reserveIn + currentIn)
+            uint256 impact = (currentIn * 20_000) / (uint(reserveA) + currentIn);
             require(impact <= maxImpact, "PRICE_IMPACT_EXCEEDED");
 
-            currentIn = ParagonLibrary.getAmountOut(currentIn, reserveA, reserveB, swapFeeBips);
+            uint32 feeBips = _effectiveFeeBipsForHop(factory, path[i], path[i + 1]);
+            currentIn = ParagonLibrary.getAmountOut(currentIn, reserveA, reserveB, feeBips);
 
             unchecked { ++i; }
         }
     }
 
     /// @notice Exact-out slippage guard helper (UI / off-chain precheck)
+    /// PAD-34 FIX: for 2-hop direct math, uses effective per-pair fee (honors overrides)
     function checkSlippageExactOut(address factory, uint amountOut, uint amountInMax, address[] calldata path) external view {
         require(path.length >= 2, "INVALID_PATH");
-        uint32 swapFeeBips = IParagonFactory(factory).swapFeeBips();
 
         if (path.length == 2) {
             (uint112 reserveA, uint112 reserveB, ) = ParagonLibrary.getReserves(factory, path[0], path[1]);
             require(reserveA > 0 && reserveB > 0, "INSUFFICIENT_LIQUIDITY");
-            // expectedIn = (reserveIn * amountOut * 10000)/( (reserveOut-amountOut)*(10000-fee) ) + 1
             require(amountOut < reserveB, "AMOUNT_OUT_TOO_HIGH");
+
+            uint32 feeBips = _effectiveFeeBipsForHop(factory, path[0], path[1]);
+
             uint256 expectedIn =
-                (uint(reserveA) * amountOut * 10_000) / ((uint(reserveB) - amountOut) * (10_000 - swapFeeBips)) + 1;
+                (uint(reserveA) * amountOut * 10_000) / ((uint(reserveB) - amountOut) * (10_000 - feeBips)) + 1;
+
             require(expectedIn <= amountInMax, "EXCESSIVE_INPUT_AMOUNT");
         } else {
-            uint[] memory amounts = ParagonLibrary.getAmountsIn(factory, amountOut, path);
+            uint[] memory amounts = ParagonLibrary.getAmountsIn(factory, amountOut, path); // already uses effective fees
             require(amounts[0] <= amountInMax, "EXCESSIVE_INPUT_AMOUNT");
         }
     }
@@ -206,6 +222,8 @@ contract ParagonRouterAdmin is Ownable {
         );
     }
 
+    /// @notice Computes max swap amount using improved ×2 impact approximation
+    /// @dev Fee does not affect this bound; it's purely reserve-based.
     function getMaxSwapAmount(address factory, address[] calldata path) external view returns (uint maxAmount) {
         require(path.length >= 2, "INVALID_PATH");
         uint32 maxImpact = maxPriceImpactBips;
@@ -217,15 +235,17 @@ contract ParagonRouterAdmin is Ownable {
             (uint112 reserveA,,) = ParagonLibrary.getReserves(factory, path[i], path[i + 1]);
             if (reserveA == 0) return 0;
 
-            // Solve: in/(reserveIn+in) <= maxImpact/10000
-            // => in <= reserveIn * maxImpact / (10000 - maxImpact)
-            uint maxForHop = (uint(reserveA) * maxImpact) / (10_000 - maxImpact);
+            // Solve: 2*in / (reserveIn + in) <= maxImpact/10000
+            // => in <= reserveIn * maxImpact / (20000 - maxImpact)
+            uint maxForHop = (uint(reserveA) * maxImpact) / (20_000 - maxImpact);
 
             if (maxForHop < maxAmount) maxAmount = maxForHop;
             unchecked { ++i; }
         }
     }
 
+    /// @notice Returns per-hop price impact using improved ×2 approximation
+    /// PAD-34 FIX: intermediate amount progression uses per-hop effective fees
     function getPathPriceImpact(address factory, uint amountIn, address[] calldata path)
         external
         view
@@ -235,13 +255,15 @@ contract ParagonRouterAdmin is Ownable {
         impacts = new uint[](path.length - 1);
 
         uint currentIn = amountIn;
-        uint32 swapFeeBips = IParagonFactory(factory).swapFeeBips();
 
         for (uint i; i < path.length - 1; ) {
             (uint112 reserveA, uint112 reserveB, ) = ParagonLibrary.getReserves(factory, path[i], path[i + 1]);
             if (reserveA > 0 && reserveB > 0) {
-                impacts[i] = (currentIn * 10_000) / (uint(reserveA) + currentIn);
-                currentIn = ParagonLibrary.getAmountOut(currentIn, reserveA, reserveB, swapFeeBips);
+                // Improved: ×2 factor for better marginal impact approximation
+                impacts[i] = (currentIn * 20_000) / (uint(reserveA) + currentIn);
+
+                uint32 feeBips = _effectiveFeeBipsForHop(factory, path[i], path[i + 1]);
+                currentIn = ParagonLibrary.getAmountOut(currentIn, reserveA, reserveB, feeBips);
             } else {
                 impacts[i] = type(uint).max;
             }
@@ -249,6 +271,7 @@ contract ParagonRouterAdmin is Ownable {
         }
     }
 
+    /// @notice Suggests slippage based on estimated path impact (now using ×2 values)
     function calculateOptimalSlippage(address factory, uint amountIn, address[] calldata path)
         external
         view
@@ -274,7 +297,6 @@ contract ParagonRouterAdmin is Ownable {
         view
         returns (bool safe, string memory reason)
     {
-        // inline validatePath (avoid external call overhead)
         if (path.length < 2 || path.length > 5) return (false, "Invalid path length");
         for (uint i; i < path.length - 1; i++) {
             if (path[i] == address(0) || path[i + 1] == address(0)) return (false, "Zero address");
@@ -282,8 +304,14 @@ contract ParagonRouterAdmin is Ownable {
         }
 
         try this.checkPriceImpactMultiHop(factory, amountIn, path) {
-            uint maxSwap = this.getMaxSwapAmount(factory, path);
-            if (amountIn > maxSwap) return (false, "Amount exceeds max swap limit");
+            // ✅ PAD-38 FIX:
+            // getMaxSwapAmount() returns a per-hop bound denominated in that hop's input token.
+            // For multi-hop paths, the minimum hop bound may be in path[i] units (i>0),
+            // so only compare directly against amountIn for direct swaps.
+            if (path.length == 2) {
+                uint maxSwap = this.getMaxSwapAmount(factory, path);
+                if (amountIn > maxSwap) return (false, "Amount exceeds max swap limit");
+            }
             return (true, "");
         } catch Error(string memory err) {
             return (false, err);

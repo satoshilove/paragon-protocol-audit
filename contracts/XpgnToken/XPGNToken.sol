@@ -131,7 +131,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
 
     /// @notice Earliest timestamp at which ecosystem streaming can begin.
     /// Before this time, ECOSYSTEM_MINTER_ROLE cannot mint at all.
-    uint256 public constant ECOSYSTEM_START_TIME = 1769852348; // Jan 31, 2026 UTC
+    uint256 public constant ECOSYSTEM_START_TIME = 1772323200; // Mar 1, 2026 UTC
 
     /// @notice Minimum time between two ecosystem mints. Enforces a simple
     /// "one mint per 30 days" schedule at the contract level.
@@ -263,10 +263,17 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     // Minting
     // -----------------------------------------------------------------------
 
+    /// @notice PAD-39 FIX (compat): Standard 2-arg mint() for legacy integrations.
+    /// @dev This maps to FARMING_MINTER_ROLE to match typical emissions/minter flows
+    ///      (e.g., EmissionsMinter expecting IMintable.mint(to, amount)).
+    function mint(address to, uint256 amount) external {
+        mint(to, amount, FARMING_MINTER_ROLE);
+    }
+
     /// @notice Unified mint entry. Role determines which bucket/cap applies.
     /// @dev TEAM / ADVISOR mints are forced to their vesting contracts.
     ///      All per-bucket caps plus the global 550M cap are enforced.
-    function mint(address to, uint256 amount, bytes32 role) external {
+    function mint(address to, uint256 amount, bytes32 role) public {
         require(
             role == FARMING_MINTER_ROLE      ||
             role == VALIDATOR_MINTER_ROLE    ||

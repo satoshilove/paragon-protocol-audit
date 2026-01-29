@@ -16,7 +16,14 @@ interface IReferralManager {
 interface IRewardDripper {
     function drip() external returns (uint256 sent);
     function pendingAccrued() external view returns (uint256);
-    function rewardToken() external view returns (address); // PAD-23
+
+    // PAD-23
+    function rewardToken() external view returns (address);
+
+    // PAD-36 hardening (optional but recommended)
+    function minDripAmount() external view returns (uint256);
+    function dripCooldownSecs() external view returns (uint64);
+    function lastDripAt() external view returns (uint64);
 }
 
 /**
@@ -228,6 +235,11 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
 
     function addPool(uint256 _allocPoint, IERC20 _lpToken, uint256 _harvestDelay) external onlyOwner {
         require(address(_lpToken) != address(0), "zero lpToken"); // PAD-15
+
+        // ────────────────────────────────────────────────
+        require(poolInfo.length < 300, "Maximum number of pools reached");
+        // ────────────────────────────────────────────────
+
         massUpdateAllPools();
         totalAllocPoint += _allocPoint;
 
@@ -268,7 +280,10 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         try dripper.pendingAccrued() returns (uint256 p) {
             if (p >= minDripAmount) {
                 try dripper.drip() returns (uint256 sent) {
-                    lastDripAt = uint64(block.timestamp);
+                    // ✅ PAD-36 FIX: only set cooldown timestamp if tokens were actually transferred
+                    if (sent > 0) {
+                        lastDripAt = uint64(block.timestamp);
+                    }
                     emit DripperPoked(sent, _availableRewards());
                 } catch {}
             }
@@ -309,9 +324,6 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         address _user,
         address _referrer
     ) external nonReentrant whenNotPaused {
-        // PAD-24 FIX:
-        // - user can always deposit for themselves
-        // - Router/Zap/etc can deposit for a user if explicitly authorized
         bool isAuto = hasRole(AUTOYIELD_CALLER_ROLE, msg.sender);
         require(msg.sender == _user || isAuto, "unauthorized");
 
@@ -328,7 +340,6 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         uint256 credited = 0;
 
         if (_amount > 0) {
-            // PAD-07: explicitly reject fee-on-transfer / deflationary / non-standard LP tokens
             uint256 balBefore = pool.lpToken.balanceOf(address(this));
             pool.lpToken.safeTransferFrom(msg.sender, address(this), _amount);
             uint256 received = pool.lpToken.balanceOf(address(this)) - balBefore;
@@ -372,7 +383,6 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         user.rewardDebt = (user.amount * pool.accRewardPerShare) / PRECISION_FACTOR;
         user.unpaid = 0;
 
-        // Respect harvestDelay
         if (gross == 0 || block.timestamp < user.lastDepositTime + pool.harvestDelay) {
             user.unpaid = gross;
             return;
@@ -452,7 +462,6 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     }
 
     function emergencyWithdraw(uint256 _pid) external nonReentrant {
-        // Always available, even when paused
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
 

@@ -27,6 +27,9 @@ interface IParagonFarmController {
     function harvest(uint256 pid) external;
     function emergencyWithdraw(uint256 pid) external;
 
+    // Dripper automation
+    function pokeDripper() external;
+
     // ---------- Admin / config (existing) ----------
     function addPool(uint256 allocPoint, IERC20 lpToken, uint256 harvestDelay, uint256 vestingDuration) external;
     function setPool(uint256 pid, uint256 allocPoint, uint256 harvestDelay, uint256 vestingDuration) external;

@@ -7,6 +7,7 @@ import "./interfaces/IParagonPair.sol";
  * @title ParagonERC20
  * @dev ERC20 implementation for Paragon LP tokens with EIP-712 permit functionality
  *      PAD-26 FIX: DOMAIN_SEPARATOR refreshes if chainId changes.
+ *      PAD-37 FIX: Disallow transfers to address(0) to prevent accidental burning.
  */
 contract ParagonERC20 {
     string public constant name = "Paragon LPs";
@@ -59,23 +60,28 @@ contract ParagonERC20 {
     }
 
     function _mint(address to, uint256 value) internal {
+        require(to != address(0), "Paragon: MINT_TO_ZERO"); // (recommended hardening)
         totalSupply += value;
         balanceOf[to] += value;
         emit Transfer(address(0), to, value);
     }
 
     function _burn(address from, uint256 value) internal {
+        // burn to zero is intended behavior
         balanceOf[from] -= value;
         totalSupply -= value;
         emit Transfer(from, address(0), value);
     }
 
     function _approve(address owner, address spender, uint256 value) private {
+        require(owner != address(0), "Paragon: APPROVE_FROM_ZERO"); // optional hardening
+        require(spender != address(0), "Paragon: APPROVE_TO_ZERO"); // optional hardening
         allowance[owner][spender] = value;
         emit Approval(owner, spender, value);
     }
 
     function _transfer(address from, address to, uint256 value) private {
+        require(to != address(0), "Paragon: TRANSFER_TO_ZERO"); // ✅ PAD-37 FIX
         balanceOf[from] -= value;
         balanceOf[to] += value;
         emit Transfer(from, to, value);
