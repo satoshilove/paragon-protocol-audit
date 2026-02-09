@@ -110,12 +110,6 @@ contract ParagonPair is ParagonERC20, ReentrancyGuard, IParagonPair {
             uint256 rootKLast = Math.sqrt(_kLastLoc);
 
             if (rootK > rootKLast) {
-                // Paragon is intentionally pro-LP:
-                // When protocol fee is enabled, we take 1/6 of the growth in sqrt(k) as new LP tokens for feeTo.
-                // We use denominator = rootK × 5 + rootKLast instead of the classic Uniswap V2 rootK × 6 + rootKLast.
-                // → This gives liquidity providers ~20% more of the protocol-fee portion than Uniswap V2 / SushiSwap.
-                // Example: at 2× pool growth, Uniswap V2 gives feeTo 0.0500% → Paragon gives feeTo only 0.0417%
-                // (the difference goes back to LPs — a deliberate design choice marketed as "More rewards for LPs").
                 uint256 numerator = totalSupply * (rootK - rootKLast);
                 uint256 denominator = rootK * 5 + rootKLast;
                 uint256 liquidity = numerator / denominator;

@@ -92,11 +92,14 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     error TokenNotRescuable();
     error UnexpectedMsgValue();
     error ZeroRecipient();
+    error InvalidCommitment();        // PAD-50 (optional clarity)
+    error CommitmentMissing();        // PAD-50 (optional clarity)
+    error CommitmentAmountMismatch(); // PAD-50
 
     struct ZapParams {
         uint256 pid;
-        address tokenIn; // address(0) for native BNB
-        uint256 amountIn; // ignored when tokenIn == address(0); uses msg.value
+        address tokenIn;            // address(0) for native BNB
+        uint256 amountIn;           // for native: MUST equal msg.value (PAD-50). for ERC20: exact pull amount
         address[] pathToTokenA;
         address[] pathToTokenB;
         uint256 minLpOut;
@@ -105,7 +108,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         address referrer;
         uint256 deadline;
         bool autoStake;
-        bytes32 salt;
+        bytes32 salt;               // required for single-sided commit/reveal
     }
 
     struct ProtocolConfig {
@@ -114,7 +117,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         address feeRecipient;
         uint256 maxSlippageBps;
         uint256 maxPathLength;
-        uint256 swapFeeBps; // fallback only
+        uint256 swapFeeBps;         // fallback only
     }
 
     event ZapExecuted(
@@ -134,12 +137,16 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     event EmergencyWithdraw(address indexed token, uint256 amount);
     event AutoStakeFallback(address indexed user, uint256 indexed pid, uint256 lpAmount);
 
+    // commit/reveal
+    event ZapCommitted(address indexed user, bytes32 indexed commitment, uint256 blockNumber);
+
     IParagonRouter public immutable router;
     IParagonFactory public immutable factory;
     IParagonFarm public immutable farm;
     address public immutable WNATIVE;
     ProtocolConfig public config;
 
+    // commitment => committedAtBlock
     mapping(bytes32 => uint256) public commitments;
     mapping(address => uint256) public referralEarnings;
 
@@ -154,6 +161,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         factory = IParagonFactory(router.factory());
         WNATIVE = router.WNative();
         farm = IParagonFarm(_farm);
+
         if (_feeRecipient == address(0) || _feeRecipient.code.length > 0) revert InvalidFeeRecipient();
 
         config = ProtocolConfig({
@@ -184,6 +192,27 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (recipient == address(0)) revert InvalidFeeRecipient();
     }
 
+    // ────────────────────────────────────────────────
+    // PAD-50 FIX:
+    // - Commitment must bind the real trade size.
+    // - For native: p.amountIn MUST be the committed native amount (not ignored).
+    // - For ERC20: p.amountIn is committed/pulled as before.
+    // - Store only commitment block; amount binding happens via hashing.
+    // ────────────────────────────────────────────────
+    function commitZap(ZapParams calldata p) external whenNotPaused {
+        // Basic amount sanity
+        if (p.amountIn == 0) revert ZeroAmount();
+
+        // Native: amountIn represents the intended msg.value during reveal (PAD-50)
+        // ERC20: amountIn represents the intended pull amount
+        // No msg.value on commit, so we just hash p.amountIn either way.
+        bytes32 paramsHash = _paramsHash(p);
+        bytes32 commitment = keccak256(abi.encodePacked(paramsHash, p.salt, msg.sender));
+        commitments[commitment] = block.number;
+
+        emit ZapCommitted(msg.sender, commitment, block.number);
+    }
+
     function zapInAndStake(ZapParams calldata p)
         external
         payable
@@ -193,11 +222,17 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     {
         if (block.timestamp > p.deadline) revert Deadline();
         if (p.recipient == address(0)) revert ZeroRecipient();
-        if (p.tokenIn != address(0) && p.amountIn == 0) revert ZeroAmount();
         if (p.slippageBps > config.maxSlippageBps) revert SlippageTooHigh();
+        if (p.amountIn == 0) revert ZeroAmount();
 
-        if (p.tokenIn != address(0) && msg.value != 0) revert UnexpectedMsgValue();
-        if (p.tokenIn == address(0) && p.amountIn != 0 && p.amountIn != msg.value) revert UnexpectedMsgValue();
+        // Strict msg.value rules (PAD-50)
+        if (p.tokenIn == address(0)) {
+            // amountIn is now REQUIRED to equal msg.value to bind commitment to execution
+            if (msg.value == 0) revert ZeroAmount();
+            if (p.amountIn != msg.value) revert CommitmentAmountMismatch();
+        } else {
+            if (msg.value != 0) revert UnexpectedMsgValue();
+        }
 
         IParagonRouter _router = router;
         IParagonFarm _farm = farm;
@@ -212,37 +247,29 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         IParagonPair pair = IParagonPair(lpToken);
         (address token0, address token1) = (pair.token0(), pair.token1());
 
-        address tokenInNormPre = (p.tokenIn == address(0)) ? WNATIVE : p.tokenIn;
-        bool singleSided = (tokenInNormPre == token0 || tokenInNormPre == token1);
+        address tokenInNorm = (p.tokenIn == address(0)) ? WNATIVE : p.tokenIn;
+
+        bool singleSided = (tokenInNorm == token0 || tokenInNorm == token1);
+
+        // Require MEV protection for single-sided
         if (singleSided && p.salt == bytes32(0)) revert MEVProtectionActive();
 
+        // Enforce commit/reveal when salt is provided (and thus for single-sided)
         if (p.salt != bytes32(0)) {
-            bytes32 paramsHash = keccak256(
-                abi.encode(
-                    p.pid,
-                    p.tokenIn,
-                    p.amountIn,
-                    p.pathToTokenA,
-                    p.pathToTokenB,
-                    p.minLpOut,
-                    p.slippageBps,
-                    p.recipient,
-                    p.referrer,
-                    p.deadline,
-                    p.autoStake,
-                    p.salt
-                )
-            );
-            bytes32 commitment = keccak256(abi.encode(paramsHash, msg.sender));
+            bytes32 paramsHash = _paramsHash(p); // includes p.amountIn (native or token)
+            bytes32 commitment = keccak256(abi.encodePacked(paramsHash, p.salt, msg.sender));
+
             uint256 committedAt = commitments[commitment];
-            if (committedAt == 0 || block.number <= committedAt + MEV_DELAY) revert MEVProtectionActive();
+            if (committedAt == 0) revert CommitmentMissing();
+            if (block.number <= committedAt + MEV_DELAY) revert MEVProtectionActive();
             delete commitments[commitment];
         }
 
+        // Pull/normalize input
         uint256 rawAmountIn;
         if (p.tokenIn == address(0)) {
+            // already validated msg.value == p.amountIn
             rawAmountIn = msg.value;
-            if (rawAmountIn == 0) revert ZeroAmount();
         } else {
             rawAmountIn = _pullTokenReturnAmount(p.tokenIn, msg.sender, p.amountIn);
         }
@@ -272,7 +299,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
 
         uint256 zapAmount = rawAmountIn - feeAmount;
 
-        address tokenInNorm = p.tokenIn == address(0) ? WNATIVE : p.tokenIn;
         if (p.tokenIn == address(0)) {
             IWrappedNative(WNATIVE).deposit{value: zapAmount}();
         }
@@ -320,6 +346,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
 
         _returnDust(token0, token1, p.recipient);
 
+        // refund leftover WNATIVE (from rounding) for native zaps
         if (p.tokenIn == address(0)) {
             uint256 wBal = IERC20(WNATIVE).balanceOf(address(this));
             if (wBal > 0) {
@@ -346,9 +373,26 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         );
     }
 
-    function commitZap(bytes32 paramsHash) external {
-        bytes32 commitment = keccak256(abi.encode(paramsHash, msg.sender));
-        commitments[commitment] = block.number;
+    // ────────────────────────────────────────────────
+    // PAD-50 FIX: paramsHash MUST include the amount that will be executed.
+    // For native, this is p.amountIn (and execution enforces msg.value == p.amountIn).
+    // ────────────────────────────────────────────────
+    function _paramsHash(ZapParams calldata p) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                p.pid,
+                p.tokenIn,
+                p.amountIn,        // bound for both native and ERC20 now
+                p.pathToTokenA,
+                p.pathToTokenB,
+                p.minLpOut,
+                p.slippageBps,
+                p.recipient,
+                p.referrer,
+                p.deadline,
+                p.autoStake
+            )
+        );
     }
 
     function _activeRouterFeeBps() internal view returns (uint256 feeBps) {
@@ -399,7 +443,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     ) internal returns (uint256 amountA, uint256 amountB) {
         (uint112 r0, uint112 r1,) = pair.getReserves();
 
-        // PAD-35: pair-specific effective fee with fallback
         uint256 feeBps;
         try factory.getEffectiveSwapFeeBips(address(pair)) returns (uint32 bps) {
             feeBps = uint256(bps);

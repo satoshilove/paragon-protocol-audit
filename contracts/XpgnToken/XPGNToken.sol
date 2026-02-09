@@ -20,50 +20,28 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 /// High-level supply map (off-chain plan, not enforced by code):
 /// - Total Maximum Supply (hard cap): 550,000,000 XPGN
 ///
-/// - Genesis Liquidity & MM: 10,000,000 XPGN total
+/// - Genesis Liquidity & MM: 10,000,000 XPGN total (GENESIS bucket)
 ///   • 202,020 XPGN minted at deploy for initial seed liquidity
-///   • ~9.8M XPGN reserve minted to treasury post-deploy and locked 12 months
-///
-/// - Farming & Emissions: up to 150,000,000 XPGN cap
-///   • Planned Year 1 budget: 72,450,000 XPGN (3→2→1.25→0.75 / block on BSC ~0.75s blocks)
-///   • Remaining ~77.55M reserved for future years (reduced schedules)
-///
-/// - Validator / Chain Reserve: up to 160,000,000 XPGN cap
-///   • Off-chain plan: ~100M actively used for validators, rest unminted/locked as long-term security reserve
-///
-/// - Ecosystem / Partners: up to 55,000,000 XPGN cap
-///   • Streamed monthly (450k max) after ECOSYSTEM_START_TIME; includes 6M locked airdrops + Eggs/Sigils/points
-///
-/// - Treasury & DAO: up to 40,000,000 XPGN cap
-///   • Used for protocol-owned liquidity, buybacks (100% fees), incentives, ops
-///
-/// - Team: up to 55,000,000 XPGN cap (must mint to teamVesting)
-/// - Advisors: up to 10,000,000 XPGN cap (must mint to advisorVesting)
-///
-/// - DAO Supplemental / Long-Term Buffer: up to 70,000,000 XPGN cap
-///   • Mintable only by DAO-controlled role for future needs (e.g. extra POL, new chain incentives),
-///     still under the global 550M cap.
+///   • Remaining up to 9,797,980 XPGN may be minted later (scarcity preserved),
+///     intended for LP/MM/launch ops and typically time-locked via a separate lock contract.
 ///
 /// NOTE (caps vs hard cap):
-/// - Sum of bucket caps (excluding GENESIS) =
-///     150M (FARMING)
+/// - Sum of bucket caps (INCLUDING GENESIS) =
+///     10M (GENESIS)
+///   + 150M (FARMING)
 ///   + 160M (VALIDATOR)
 ///   +  55M (ECOSYSTEM)
 ///   +  40M (TREASURY)
 ///   +  55M (TEAM)
 ///   +  10M (ADVISOR)
 ///   +  70M (SUPPLEMENTAL)
-///   = 540,000,000 XPGN
-/// - Conceptual GENESIS allocation = 10,000,000 XPGN
-/// - Total planned = 550,000,000 XPGN, matching the ERC20Capped hard cap.
+///   = 550,000,000 XPGN (matches ERC20Capped hard cap).
 ///
 /// The contract enforces:
 /// - 550M global cap (ERC20Capped)
-/// - Per-bucket caps (FARMING / VALIDATOR / ECOSYSTEM / TREASURY / TEAM / ADVISOR / SUPPLEMENTAL)
+/// - Per-bucket caps (GENESIS / FARMING / VALIDATOR / ECOSYSTEM / TREASURY / TEAM / ADVISOR / SUPPLEMENTAL)
 /// - Ecosystem mints: 1x per 30 days, post-start, <= ECOSYSTEM_MONTHLY_LIMIT
 /// - Team / Advisor must mint only to their vesting contracts.
-/// The **exact emission schedule** (e.g. Q1/Q2/Q3/Q4 emissions) is implemented
-/// in the farm + dripper + gauge system, *within* these static caps.
 contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumerable, Pausable {
     // -----------------------------------------------------------------------
     // Admin
@@ -76,6 +54,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     // Roles
     // -----------------------------------------------------------------------
 
+    bytes32 public constant GENESIS_MINTER_ROLE      = keccak256("GENESIS_MINTER_ROLE");      // Genesis liquidity/MM reserve (up to 10M incl. seed)
     bytes32 public constant FARMING_MINTER_ROLE      = keccak256("FARMING_MINTER_ROLE");      // farms / gauges (MasterChef / gauges)
     bytes32 public constant VALIDATOR_MINTER_ROLE    = keccak256("VALIDATOR_MINTER_ROLE");    // validator / chain reserve distributor
     bytes32 public constant ECOSYSTEM_MINTER_ROLE    = keccak256("ECOSYSTEM_MINTER_ROLE");    // ecosystem / partners / grants (streamed)
@@ -88,64 +67,34 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     // Bucket Caps (all 18 decimals, HARD MAXIMUMS)
     // -----------------------------------------------------------------------
 
-    /// @dev Maximum XPGN that can ever be minted for farming, gauges, and all
-    /// reward/emission mechanisms combined. The **planned** Year 1 emissions
-    /// (~72.45M XPGN) are a subset of this, leaving ~77.55M headroom for future years
-    /// with lower emission rates. Cannot be increased after deployment.
-    uint256 public constant FARMING_MINT_CAP = 150_000_000 ether; // Liquidity & Gauges (emissions, multi-year max);
+    /// @dev Genesis bucket (fixes PAD-49): total genesis allocation is tracked and mintable up to 10M,
+    /// but only 202,020 is minted at deploy to preserve scarcity.
+    uint256 public constant GENESIS_MINT_CAP = 10_000_000 ether;
 
-    /// @dev Maximum XPGN reserved for validators / chain security / staking.
-    /// Off-chain plan: ~100M actively used, rest unminted/locked as long-term security reserve.
+    uint256 public constant FARMING_MINT_CAP = 150_000_000 ether; // Liquidity & Gauges (emissions, multi-year max)
     uint256 public constant VALIDATOR_MINT_CAP = 160_000_000 ether; // Validator / Chain Reserve (planned subset)
-
-    /// @dev Maximum XPGN for ecosystem growth: integrations, partners, grants,
-    /// points → veXPGN programs, and campaign incentives (incl. 6M locked airdrops). Actual streaming is
-    /// governed by ECOSYSTEM_* config below (time-gated, monthly limit).
     uint256 public constant ECOSYSTEM_MINT_CAP = 55_000_000 ether; // Ecosystem / Airdrops / Utilities (streamed)
-
-    /// @dev Maximum XPGN for Treasury / DAO ops: protocol-owned liquidity,
-    /// buyback funding (100% fees), strategic incentives, and emergency buffers.
     uint256 public constant TREASURY_MINT_CAP = 40_000_000 ether; // DAO & Treasury (buybacks, POL, ops)
-
-    /// @dev Maximum XPGN for team allocations. All mints MUST go to teamVesting,
-    /// which enforces 12mo cliff + 36mo linear vesting (first unlock 2027).
     uint256 public constant TEAM_MINT_CAP = 55_000_000 ether; // Team (must mint to teamVesting)
-
-    /// @dev Maximum XPGN for advisors / early helpers. All mints MUST go to
-    /// advisorVesting, which enforces 24mo linear vesting.
     uint256 public constant ADVISOR_MINT_CAP = 10_000_000 ether; // Advisors (must mint to advisorVesting)
-
-    /// @dev Maximum XPGN for DAO-controlled supplemental needs: future POL, new chain incentives,
-    /// or long-term expansions. Mintable only by SUPPLEMENTAL_MINTER_ROLE and still under the 550M cap.
     uint256 public constant SUPPLEMENTAL_MINT_CAP = 70_000_000 ether; // DAO supplemental buffer
 
-    /// @dev Total genesis allocation for initial DEX liquidity / MM.
-    /// GENESIS_MINT_AMOUNT is the *conceptual* total genesis allocation (10M).
-    /// At deploy, only 202,020 XPGN are minted here for the launch seed.
-    /// The remaining reserve is minted later via TREASURY_MINTER_ROLE and counts against TREASURY_MINT_CAP.
-    uint256 public constant GENESIS_MINT_AMOUNT = 10_000_000 ether; // Genesis Liquidity & MM (202k launch + 9.8M reserve via treasury)
+    /// @dev (kept for docs) conceptual genesis allocation. Enforced via GENESIS_MINT_CAP + genesisMinted.
+    uint256 public constant GENESIS_MINT_AMOUNT = 10_000_000 ether;
 
     // -----------------------------------------------------------------------
     // Ecosystem streaming config (monthly)
     // -----------------------------------------------------------------------
 
-    /// @notice Earliest timestamp at which ecosystem streaming can begin.
-    /// Before this time, ECOSYSTEM_MINTER_ROLE cannot mint at all.
     uint256 public constant ECOSYSTEM_START_TIME = 1772323200; // Mar 1, 2026 UTC
-
-    /// @notice Minimum time between two ecosystem mints. Enforces a simple
-    /// "one mint per 30 days" schedule at the contract level.
     uint256 public constant ECOSYSTEM_VESTING_PERIOD = 30 days;
-
-    /// @notice Maximum XPGN that can be minted in a single ecosystem mint
-    /// (i.e. per 30-day epoch). This, combined with the total ECOSYSTEM_MINT_CAP,
-    /// bounds both the **rate** and **total** of ecosystem emissions.
     uint256 public constant ECOSYSTEM_MONTHLY_LIMIT = 450_000 ether;
 
     // -----------------------------------------------------------------------
     // Mint tracking
     // -----------------------------------------------------------------------
 
+    uint256 public genesisMinted;
     uint256 public farmingMinted;
     uint256 public validatorMinted;
     uint256 public ecosystemMinted;
@@ -161,12 +110,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     // Enforced recipients (vesting)
     // -----------------------------------------------------------------------
 
-    /// @notice All TEAM mints must go to this vesting contract. The vesting
-    /// contract enforces 12mo cliff + 36mo linear vesting (first unlock 2027).
     address public immutable teamVesting;    // all TEAM mints must go here
-
-    /// @notice All ADVISOR mints must go to this vesting contract, which handles
-    /// 24mo linear vesting.
     address public immutable advisorVesting; // all ADVISOR mints must go here
 
     // -----------------------------------------------------------------------
@@ -187,7 +131,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     /// @param validatorRewards validator reserve distributor contract
     /// @param _teamVesting     team vesting contract (enforced recipient)
     /// @param _advisorVesting  advisor vesting contract (enforced recipient)
-    /// @param genesisRecipient recipient of 202,020 genesis liquidity (DEX seed; reserve minted separately to treasury)
+    /// @param genesisRecipient recipient of 202,020 genesis liquidity (DEX seed)
     constructor(
         address daoMultisig,
         address masterChef,
@@ -211,23 +155,29 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
         _grantRole(DEFAULT_ADMIN_ROLE, daoMultisig);
 
         // Assign minters per bucket
+        // NOTE: You asked for "admin/team hold the role until DAO takeover":
+        // - Start with daoMultisig holding GENESIS + TREASURY + other admin roles.
+        // - Later, DAO governance can be granted roles and the multisig can revoke itself.
+        _grantRole(GENESIS_MINTER_ROLE,      daoMultisig);
         _grantRole(FARMING_MINTER_ROLE,      masterChef);
         _grantRole(VALIDATOR_MINTER_ROLE,    validatorRewards);
         _grantRole(ECOSYSTEM_MINTER_ROLE,    daoMultisig);
         _grantRole(TREASURY_MINTER_ROLE,     daoMultisig);
         _grantRole(TEAM_MINTER_ROLE,         daoMultisig);
         _grantRole(ADVISOR_MINTER_ROLE,      daoMultisig);
-        _grantRole(SUPPLEMENTAL_MINTER_ROLE, daoMultisig); // DAO-only supplemental buffer
+        _grantRole(SUPPLEMENTAL_MINTER_ROLE, daoMultisig);
 
         teamVesting    = _teamVesting;
         advisorVesting = _advisorVesting;
 
-        // Launch Seed Mint: Only 202,020 XPGN for initial seed liquidity
-        // Remaining genesis reserve is minted later via TREASURY_MINTER_ROLE and locked 12 months.
+        // Launch Seed Mint: only 202,020 XPGN minted now (scarcity preserved).
+        // The remaining GENESIS bucket (up to 10M total) can be minted later via GENESIS_MINTER_ROLE
+        // and should typically be sent to a timelock/vesting/LP lock contract.
         _mint(genesisRecipient, 202_020 ether);
+        genesisMinted += 202_020 ether;
+        require(genesisMinted <= GENESIS_MINT_CAP, "GENESIS_CAP_EXCEEDED");
         emit Mint(genesisRecipient, 202_020 ether, bytes32("GENESIS_LAUNCH_SEED"));
 
-        // Ecosystem streaming not yet used
         lastEcosystemMintTime = 0;
     }
 
@@ -240,7 +190,6 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     }
 
     /// @notice Optional: rotate admin label (does NOT change DEFAULT_ADMIN_ROLE).
-    /// Can be used if the DAO migrates control from one multisig to another.
     function setAdmin(address newAdmin) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(newAdmin != address(0), "INVALID_ADMIN");
         admin = newAdmin;
@@ -264,8 +213,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     // -----------------------------------------------------------------------
 
     /// @notice PAD-39 FIX (compat): Standard 2-arg mint() for legacy integrations.
-    /// @dev This maps to FARMING_MINTER_ROLE to match typical emissions/minter flows
-    ///      (e.g., EmissionsMinter expecting IMintable.mint(to, amount)).
+    /// @dev Maps to FARMING_MINTER_ROLE.
     function mint(address to, uint256 amount) external {
         mint(to, amount, FARMING_MINTER_ROLE);
     }
@@ -275,6 +223,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     ///      All per-bucket caps plus the global 550M cap are enforced.
     function mint(address to, uint256 amount, bytes32 role) public {
         require(
+            role == GENESIS_MINTER_ROLE      ||
             role == FARMING_MINTER_ROLE      ||
             role == VALIDATOR_MINTER_ROLE    ||
             role == ECOSYSTEM_MINTER_ROLE    ||
@@ -287,7 +236,13 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
         require(hasRole(role, msg.sender), "CALLER_NOT_MINTER");
         require(amount > 0, "ZERO_AMOUNT");
 
-        if (role == FARMING_MINTER_ROLE) {
+        if (role == GENESIS_MINTER_ROLE) {
+            // PAD-49 FIX: genesis is a real tracked bucket, so the full 550M hard cap is reachable.
+            // Keeps scarcity because only 202,020 is minted at deploy; remainder is optional.
+            genesisMinted += amount;
+            require(genesisMinted <= GENESIS_MINT_CAP, "GENESIS_CAP_EXCEEDED");
+
+        } else if (role == FARMING_MINTER_ROLE) {
             farmingMinted += amount;
             require(farmingMinted <= FARMING_MINT_CAP, "FARMING_CAP_EXCEEDED");
 
@@ -297,7 +252,6 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
             require(validatorMinted <= VALIDATOR_MINT_CAP, "VALIDATOR_CAP_EXCEEDED");
 
         } else if (role == ECOSYSTEM_MINTER_ROLE) {
-            // Simple “one mint per 30 days, <= monthly limit” after start date
             require(block.timestamp >= ECOSYSTEM_START_TIME, "ECOSYSTEM_NOT_STARTED");
 
             if (lastEcosystemMintTime != 0) {
@@ -335,7 +289,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
 
         _mint(to, amount);
         emit Mint(to, amount, role);
-        // ERC20Capped will also enforce the global 550M cap across all buckets + GENESIS
+        // ERC20Capped enforces global 550M cap across all buckets combined.
     }
 
     // -----------------------------------------------------------------------

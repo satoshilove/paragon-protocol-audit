@@ -154,12 +154,12 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         }
     }
 
-    function _enforceXpgnNotPaused(address[] memory path) internal view {
+    function _enforceXpgnNotPaused(address[] memory pth) internal view {
         address xpgn = IParagonFactory(factory).xpgnToken();
         if (xpgn == address(0)) return;
 
-        for (uint i = 0; i < path.length; ++i) {
-            if (path[i] == xpgn) {
+        for (uint i = 0; i < pth.length; ++i) {
+            if (pth[i] == xpgn) {
                 require(!IPausableToken(xpgn).paused(), "Paragon: XPGN_PAUSED");
                 return;
             }
@@ -177,6 +177,24 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         require(actualIn * 10000 >= expectedIn * (10000 - uint256(tol)), "Paragon: FOT_TOO_HIGH");
     }
 
+    // =========================================================
+    // PAD-48 FIX (helper): compute first-hop effective input
+    // effectiveIn = balanceIn(pair) - reserveIn (matches pair logic)
+    // =========================================================
+    function _firstHopEffectiveIn(
+        address inputToken,
+        address outputToken,
+        address pair
+    ) internal view returns (uint256 effectiveIn) {
+        // reserves are ordered by token sort; map to reserveIn for inputToken
+        (address token0,) = ParagonLibrary.sortTokens(inputToken, outputToken);
+        (uint112 r0, uint112 r1,) = IParagonPair(pair).getReserves();
+        uint256 reserveIn = inputToken == token0 ? uint256(r0) : uint256(r1);
+
+        uint256 balIn = IERC20(inputToken).balanceOf(pair);
+        effectiveIn = balIn > reserveIn ? (balIn - reserveIn) : 0;
+    }
+
     // ---------------------- Internals (auto-yield) ----------------------
     function _effectiveAutoYieldPercent(
         address msgSender,
@@ -185,18 +203,21 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     ) internal view returns (uint8) {
         if (!autoYieldEnabled) return 0;
 
+        // Security: auto-yield can only be activated when recipient == caller
+        // Prevents third parties from forcing staking on transfers to others (PAD-46)
+        if (to != msgSender) return 0;
+
+        uint8 rawPercent;
+
         if (autoYieldPercentParam != USE_SAVED_PREF) {
-            if (autoYieldPercentParam > 3) return 3;
-            return (to == msgSender) ? autoYieldPercentParam : 0;
+            rawPercent = autoYieldPercentParam;
+        } else {
+            rawPercent = userAutoYieldBips[msgSender];
         }
 
-        if (to == msgSender) {
-            uint8 saved = userAutoYieldBips[msgSender];
-            return saved > 3 ? 3 : saved;
-        }
-
-        return 0;
-    }
+        // Hard cap at 3% — frontend should prevent >3, but enforce on-chain anyway
+        return rawPercent > 3 ? 3 : rawPercent;
+   }
 
     function _isXPGN(address token) internal view returns (bool) {
         address xpgn = IParagonFactory(factory).xpgnToken();
@@ -250,10 +271,10 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     }
 
     // ---------------------- Internals (liquidity & path) ----------------------
-    function _checkPath(address[] memory path) internal pure {
-        uint len = path.length;
+    function _checkPath(address[] memory pth) internal pure {
+        uint len = pth.length;
         require(len >= 2 && len <= 5, "Paragon: BAD_PATH");
-        for (uint i = 0; i < len - 1; ++i) require(path[i] != path[i + 1], "Paragon: IDENTICAL");
+        for (uint i = 0; i < len - 1; ++i) require(pth[i] != pth[i + 1], "Paragon: IDENTICAL");
     }
 
     function _addLiquidity(
@@ -283,14 +304,19 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         }
     }
 
-    function _pathHasProtected(address[] memory path) internal view returns (bool) {
-        for (uint i = 0; i < path.length; i++) {
-            if (protectedToken[path[i]]) return true;
+    function _pathHasProtected(address[] memory pth) internal view returns (bool) {
+        for (uint i = 0; i < pth.length; i++) {
+            if (protectedToken[pth[i]]) return true;
         }
         return false;
     }
 
-    function _oracleMinOutMaybe(uint amountIn, address[] memory route) internal view returns (uint minOut, bool ok) {
+    // =========================================================
+    // PAD-44 FIX: Oracle+Impact checks for FOT paths
+    // PAD-45 FIX: do NOT compute impact post-swap using reserves
+    // =========================================================
+
+    function _oracleQuoteOutMaybe(uint amountIn, address[] memory route) internal view returns (uint quoteOut, bool ok) {
         if (address(priceOracle) == address(0)) return (0, false);
 
         uint[] memory o;
@@ -310,9 +336,15 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         }
 
         if (o.length == 0) return (0, false);
-
-        uint quoteOut = o[o.length - 1];
+        quoteOut = o[o.length - 1];
         if (quoteOut == 0) return (0, false);
+
+        ok = true;
+    }
+
+    function _oracleMinOutMaybe(uint amountIn, address[] memory route) internal view returns (uint minOut, bool ok) {
+        (uint quoteOut, bool qOk) = _oracleQuoteOutMaybe(amountIn, route);
+        if (!qOk) return (0, false);
 
         minOut = (quoteOut * (10000 - maxSlippageBips)) / 10000;
         ok = true;
@@ -346,14 +378,24 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         return maxBips;
     }
 
+    function _impactBipsOverall(uint256 expectedOut, uint256 actualOut) internal pure returns (uint16) {
+        if (expectedOut == 0) return type(uint16).max;
+        if (actualOut >= expectedOut) return 0;
+
+        uint256 diff = expectedOut - actualOut;
+        uint256 bips = (diff * 10000) / expectedOut;
+        if (bips > type(uint16).max) return type(uint16).max;
+        return uint16(bips);
+    }
+
     function _enforceOracleGuard(
         uint256 amountIn,
-        address[] memory path,
+        address[] memory pth,
         uint256 amountOut
     ) internal {
-        if (!guardEnabled || !_pathHasProtected(path)) return;
+        if (!guardEnabled || !_pathHasProtected(pth)) return;
 
-        (uint256 minOut, bool oracleOk) = _oracleMinOutMaybe(amountIn, path);
+        (uint256 minOut, bool oracleOk) = _oracleMinOutMaybe(amountIn, pth);
 
         if (failOpen) {
             if (oracleOk && minOut > 0) {
@@ -364,19 +406,25 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
             require(amountOut >= minOut, "Paragon: ORACLE_SLIPPAGE");
         }
 
-        uint256[] memory amountsCalc = ParagonLibrary.getAmountsOut(factory, amountIn, path);
-        uint16 impact = _impactBips(amountIn, path, amountsCalc);
+        uint256[] memory amountsCalc = ParagonLibrary.getAmountsOut(factory, amountIn, pth);
+        uint16 impact = _impactBips(amountIn, pth, amountsCalc);
         require(impact <= maxImpactBips, "Paragon: PRICE_IMPACT");
     }
 
     function _enforceOracleGuardPostSwap(
         uint256 effectiveIn,
-        address[] memory path,
+        address[] memory pth,
         uint256 actualOut
     ) internal {
-        if (!guardEnabled || !_pathHasProtected(path)) return;
+        if (!guardEnabled || !_pathHasProtected(pth)) return;
 
-        (uint256 minOut, bool oracleOk) = _oracleMinOutMaybe(effectiveIn, path);
+        (uint256 quoteOut, bool oracleOk) = _oracleQuoteOutMaybe(effectiveIn, pth);
+
+        uint256 extra = uint256(_fotToleranceBips());
+        uint256 totalSlip = uint256(maxSlippageBips) + extra;
+        if (totalSlip > 10000) totalSlip = 10000;
+
+        uint256 minOut = oracleOk ? (quoteOut * (10000 - totalSlip)) / 10000 : 0;
 
         if (failOpen) {
             if (oracleOk && minOut > 0) {
@@ -386,10 +434,6 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
             require(oracleOk && minOut > 0, "Paragon: ORACLE_FAIL");
             require(actualOut >= minOut, "Paragon: ORACLE_SLIPPAGE");
         }
-
-        uint256[] memory amountsCalc = ParagonLibrary.getAmountsOut(factory, effectiveIn, path);
-        uint16 impact = _impactBips(effectiveIn, path, amountsCalc);
-        require(impact <= maxImpactBips, "Paragon: PRICE_IMPACT");
     }
 
     // ---------------------- View quoting ----------------------
@@ -507,6 +551,7 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
             amountAMin,
             amountBMin
         );
+
         address pair = ParagonLibrary.pairFor(factory, tokenA, tokenB);
         IERC20(tokenA).safeTransferFrom(msg.sender, pair, amountA);
         IERC20(tokenB).safeTransferFrom(msg.sender, pair, amountB);
@@ -544,6 +589,7 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
             amountTokenMin,
             amountNativeMin
         );
+
         address pair = ParagonLibrary.pairFor(factory, token, WNative);
         IERC20(token).safeTransferFrom(msg.sender, pair, amountToken);
         IWETH(WNative).deposit{value: amountNative}();
@@ -965,21 +1011,33 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
 
         address inputToken = r[0];
         address firstPair = ParagonLibrary.pairFor(factory, inputToken, r[1]);
+
         uint256 balanceBefore = IERC20(inputToken).balanceOf(firstPair);
-
         IERC20(inputToken).safeTransferFrom(msg.sender, firstPair, amountIn);
+        uint256 balanceAfter = IERC20(inputToken).balanceOf(firstPair);
 
-        uint256 actualIn = IERC20(inputToken).balanceOf(firstPair) - balanceBefore;
-
+        uint256 actualIn = balanceAfter - balanceBefore;
         _enforceFOTTolerance(amountIn, actualIn);
 
+        // ✅ PAD-48: use the same effective input the pair uses (balanceIn - reserveIn)
+        uint256 effectiveIn = _firstHopEffectiveIn(inputToken, r[1], firstPair);
+        require(effectiveIn > 0, "Paragon: INSUFF_INPUT");
+
+        // expectedOut based on effectiveIn (pre-swap reserves)
+        uint256[] memory amountsPre = ParagonLibrary.getAmountsOut(factory, effectiveIn, r);
+        uint256 expectedOutPre = amountsPre[amountsPre.length - 1];
+
         uint256 beforeBal = IERC20(outToken).balanceOf(finalTo);
-
         ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(r, factory, finalTo);
-
         amountOut = IERC20(outToken).balanceOf(finalTo) - beforeBal;
 
-        _enforceOracleGuardPostSwap(actualIn, r, amountOut);
+        // ✅ PAD-48: post-swap guard uses effectiveIn
+        _enforceOracleGuardPostSwap(effectiveIn, r, amountOut);
+
+        uint16 impactOverall = _impactBipsOverall(expectedOutPre, amountOut);
+        uint256 allowed = uint256(maxImpactBips) + uint256(_fotToleranceBips());
+        if (allowed > 2000) allowed = 2000;
+        require(uint256(impactOverall) <= allowed, "Paragon: PRICE_IMPACT");
 
         require(amountOut >= grossMin, "Paragon: INSUFF_OUTPUT");
 
@@ -1031,9 +1089,17 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
 
         assert(IWETH(WNative).transfer(firstPair, msg.value));
 
-        uint256 actualIn = IERC20(WNative).balanceOf(firstPair) - balanceBefore;
+        uint256 balanceAfter = IERC20(WNative).balanceOf(firstPair);
+        uint256 actualIn = balanceAfter - balanceBefore;
 
         _enforceFOTTolerance(msg.value, actualIn);
+
+        // ✅ PAD-48: effective input for hop0
+        uint256 effectiveIn = _firstHopEffectiveIn(WNative, r[1], firstPair);
+        require(effectiveIn > 0, "Paragon: INSUFF_INPUT");
+
+        uint256[] memory amountsPre = ParagonLibrary.getAmountsOut(factory, effectiveIn, r);
+        uint256 expectedOutPre = amountsPre[amountsPre.length - 1];
 
         uint256 beforeBal = IERC20(outToken).balanceOf(finalTo);
 
@@ -1041,7 +1107,12 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
 
         amountOut = IERC20(outToken).balanceOf(finalTo) - beforeBal;
 
-        _enforceOracleGuardPostSwap(actualIn, r, amountOut);
+        _enforceOracleGuardPostSwap(effectiveIn, r, amountOut);
+
+        uint16 impactOverall = _impactBipsOverall(expectedOutPre, amountOut);
+        uint256 allowed = uint256(maxImpactBips) + uint256(_fotToleranceBips());
+        if (allowed > 2000) allowed = 2000;
+        require(uint256(impactOverall) <= allowed, "Paragon: PRICE_IMPACT");
 
         require(amountOut >= grossMin, "Paragon: INSUFF_OUTPUT");
 
@@ -1079,13 +1150,20 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
 
         address inputToken = r[0];
         address firstPair = ParagonLibrary.pairFor(factory, inputToken, r[1]);
+
         uint256 balanceBefore = IERC20(inputToken).balanceOf(firstPair);
-
         IERC20(inputToken).safeTransferFrom(msg.sender, firstPair, amountIn);
+        uint256 balanceAfter = IERC20(inputToken).balanceOf(firstPair);
 
-        uint256 actualIn = IERC20(inputToken).balanceOf(firstPair) - balanceBefore;
-
+        uint256 actualIn = balanceAfter - balanceBefore;
         _enforceFOTTolerance(amountIn, actualIn);
+
+        // ✅ PAD-48: effective input for hop0
+        uint256 effectiveIn = _firstHopEffectiveIn(inputToken, r[1], firstPair);
+        require(effectiveIn > 0, "Paragon: INSUFF_INPUT");
+
+        uint256[] memory amountsPre = ParagonLibrary.getAmountsOut(factory, effectiveIn, r);
+        uint256 expectedOutPre = amountsPre[amountsPre.length - 1];
 
         uint256 beforeBal = IERC20(WNative).balanceOf(address(this));
 
@@ -1093,7 +1171,12 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
 
         uint256 wReceived = IERC20(WNative).balanceOf(address(this)) - beforeBal;
 
-        _enforceOracleGuardPostSwap(actualIn, r, wReceived);
+        _enforceOracleGuardPostSwap(effectiveIn, r, wReceived);
+
+        uint16 impactOverall = _impactBipsOverall(expectedOutPre, wReceived);
+        uint256 allowed = uint256(maxImpactBips) + uint256(_fotToleranceBips());
+        if (allowed > 2000) allowed = 2000;
+        require(uint256(impactOverall) <= allowed, "Paragon: PRICE_IMPACT");
 
         require(wReceived >= amountOutMin, "Paragon: INSUFF_OUTPUT");
 

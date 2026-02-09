@@ -25,12 +25,14 @@ error NoObservation();
 error FeedDecimalsDiffTooLarge();
 error TokenDecimalsDiffTooLarge();
 error NotUpdater();
+error InvalidBaseToken(); // PAD-42
 
 // -------------------- FixedPoint (Uniswap-style) --------------------
 library FixedPoint {
     struct uq112x112 {
         uint224 _x;
     }
+
     uint8 private constant RESOLUTION = 112;
 
     function fraction(uint112 numerator, uint112 denominator) internal pure returns (uq112x112 memory) {
@@ -65,9 +67,14 @@ library ParagonOracleLibrary {
 
         if (blockTimestampLast != blockTimestamp) {
             unchecked {
+                // IMPORTANT: use uint32 timestamps for Uniswap-style wrap semantics
                 uint32 timeElapsed = blockTimestamp - blockTimestampLast;
-                price0Cumulative += uint256(FixedPoint.fraction(reserve1, reserve0)._x) * timeElapsed;
-                price1Cumulative += uint256(FixedPoint.fraction(reserve0, reserve1)._x) * timeElapsed;
+
+                // If reserves are zero, the pair itself would not update cumulatives; keep behavior safe here too.
+                if (reserve0 != 0 && reserve1 != 0) {
+                    price0Cumulative += uint256(FixedPoint.fraction(reserve1, reserve0)._x) * timeElapsed;
+                    price1Cumulative += uint256(FixedPoint.fraction(reserve0, reserve1)._x) * timeElapsed;
+                }
             }
         }
     }
@@ -77,10 +84,9 @@ library ParagonOracleLibrary {
 contract ParagonOracle is Ownable {
     using FixedPoint for FixedPoint.uq112x112;
 
-    // ────────────────────────────────────────────────
-    // TWAP observation storage – RING BUFFER (PAD-29 FULL FIX)
-    // 12 slots: covers ~12 min with 60s updates → safe for 600s default window
-    // ────────────────────────────────────────────────
+    uint8 private constant RESOLUTION = 112;
+    uint8 private constant RING_SIZE = 12;
+
     struct Observation {
         uint256 price0Cumulative;
         uint256 price1Cumulative;
@@ -88,17 +94,16 @@ contract ParagonOracle is Ownable {
     }
 
     struct ObsRing {
-        Observation[12] obs;     // fixed-size circular buffer
-        uint8 index;             // last written index (valid only when count > 0)
-        uint8 count;             // number of valid observations written (≤12)
+        Observation[12] obs;
+        uint8 index;
+        uint8 count;
     }
 
-    mapping(address => ObsRing) public observationRings; // pair => ring buffer
+    mapping(address => ObsRing) public observationRings;
 
     uint32 public defaultTwapTimeWindow = 600;
     uint32 public minObservationPeriod = 60;
 
-    // Chainlink config
     mapping(address => address) public chainlinkFeeds;
     mapping(address => uint256) public chainlinkStalenessThreshold;
 
@@ -109,6 +114,10 @@ contract ParagonOracle is Ownable {
 
     mapping(address => bool) public isUpdater;
 
+    // PAD-42: canonical base tokens used for USD helper pricing
+    address public usdtToken;
+    address public wbnbToken;
+
     // Events
     event ChainlinkFeedSet(address indexed token, address indexed feed, uint256 stalenessThreshold);
     event ChainlinkFeedRemoved(address indexed token);
@@ -117,14 +126,33 @@ contract ParagonOracle is Ownable {
     event AdminPriceSet(address indexed token, uint256 price1e18, bool enabled);
     event ObservationUpdated(address indexed pair, uint256 p0, uint256 p1, uint32 ts, uint8 newIndex);
     event UpdaterSet(address indexed updater, bool allowed);
-
-    uint8 private constant RING_SIZE = 12;
+    event BaseTokensSet(address indexed usdt, address indexed wbnb); // PAD-42
 
     constructor(address _factory) Ownable(msg.sender) {
         if (_factory == address(0)) revert ZeroAddress();
         factory = _factory;
         isUpdater[msg.sender] = true;
         emit UpdaterSet(msg.sender, true);
+    }
+
+    // ────────────────────────────────────────────────
+    // PAD-42: base token config + validation
+    // ────────────────────────────────────────────────
+    function setBaseTokens(address _usdt, address _wbnb) external onlyOwner {
+        if (_usdt == address(0) || _wbnb == address(0)) revert ZeroAddress();
+        if (_usdt == _wbnb) revert IdenticalAddresses();
+        usdtToken = _usdt;
+        wbnbToken = _wbnb;
+        emit BaseTokensSet(_usdt, _wbnb);
+    }
+
+    function baseTokensConfigured() external view returns (bool) {
+        return usdtToken != address(0) && wbnbToken != address(0);
+    }
+
+    function _validateBases(address usdt, address wbnb) internal view {
+        // Require the caller-provided bases match the canonical tokens (PAD-42)
+        if (usdt != usdtToken || wbnb != wbnbToken) revert InvalidBaseToken();
     }
 
     // ────────────────────────────────────────────────
@@ -218,6 +246,20 @@ contract ParagonOracle is Ownable {
         return 10 ** n;
     }
 
+    /// @dev PAD-43: normalize an amount denominated in `tokenDecimals` into 1e18 scale
+    function _to1e18(uint256 amount, uint8 tokenDecimals) internal pure returns (uint256) {
+        if (amount == 0) return 0;
+        if (tokenDecimals == 18) return amount;
+
+        if (tokenDecimals < 18) {
+            uint256 m = _pow10Token(uint256(18 - tokenDecimals));
+            return Math.mulDiv(amount, m, 1);
+        } else {
+            uint256 d = _pow10Token(uint256(tokenDecimals - 18));
+            return amount / d;
+        }
+    }
+
     // ────────────────────────────────────────────────
     // Chainlink
     // ────────────────────────────────────────────────
@@ -254,20 +296,22 @@ contract ParagonOracle is Ownable {
             if (fdIn < fdOut) pIn *= _pow10Feed(uint256(fdOut - fdIn));
             else if (fdOut < fdIn) pOut *= _pow10Feed(uint256(fdIn - fdOut));
 
-            uint256 out = Math.mulDiv(amounts[i], pIn, pOut);
-
             uint8 dIn = _safeTokenDecimals(tIn);
             uint8 dOut = _safeTokenDecimals(tOut);
 
-            if (dOut > dIn) out *= _pow10Token(uint256(dOut - dIn));
-            else if (dIn > dOut) out /= _pow10Token(uint256(dIn - dOut));
+            uint256 numeratorScale   = (dOut > dIn)  ? _pow10Token(uint256(dOut - dIn))  : 1;
+            uint256 denominatorScale = (dIn  > dOut) ? _pow10Token(uint256(dIn  - dOut)) : 1;
 
+            uint256 effectivePriceIn  = Math.mulDiv(pIn,  numeratorScale,   1);
+            uint256 effectivePriceOut = Math.mulDiv(pOut, denominatorScale, 1);
+
+            uint256 out = Math.mulDiv(amounts[i], effectivePriceIn, effectivePriceOut);
             amounts[i + 1] = out;
         }
     }
 
     // ────────────────────────────────────────────────
-    // TWAP – Ring Buffer Update (fixed first-write + prev selection)
+    // TWAP – Observation Management
     // ────────────────────────────────────────────────
     function updateObservation(address tokenA, address tokenB) external returns (bool updated) {
         if (!isUpdater[msg.sender]) revert NotUpdater();
@@ -282,7 +326,6 @@ contract ParagonOracle is Ownable {
 
         ObsRing storage ring = observationRings[pair];
 
-        // last observation (only meaningful once count > 0)
         Observation memory prev = ring.count == 0 ? Observation(0, 0, 0) : ring.obs[ring.index];
 
         if (prev.timestamp != 0) {
@@ -292,7 +335,6 @@ contract ParagonOracle is Ownable {
             }
         }
 
-        // first write goes to slot 0; then circular
         uint8 next = ring.count == 0 ? 0 : uint8((ring.index + 1) % RING_SIZE);
 
         ring.obs[next] = Observation({
@@ -302,16 +344,12 @@ contract ParagonOracle is Ownable {
         });
 
         ring.index = next;
-
         if (ring.count < RING_SIZE) ring.count++;
 
         emit ObservationUpdated(pair, p0, p1, ts, next);
         return true;
     }
 
-    // ────────────────────────────────────────────────
-    // Select newest observation old enough for the required window
-    // ────────────────────────────────────────────────
     function _selectObservation(address pair, uint32 nowTs, uint32 requiredWindow)
         internal
         view
@@ -320,10 +358,8 @@ contract ParagonOracle is Ownable {
         ObsRing storage ring = observationRings[pair];
         if (ring.count == 0) return (Observation(0, 0, 0), false);
 
-        // clamp to avoid underflow
         uint32 cutoff = nowTs > requiredWindow ? nowTs - requiredWindow : 0;
 
-        // Walk backwards from newest to oldest
         for (uint8 k = 0; k < ring.count; ++k) {
             uint8 idx = uint8((RING_SIZE + ring.index - k) % RING_SIZE);
             Observation memory o = ring.obs[idx];
@@ -335,9 +371,10 @@ contract ParagonOracle is Ownable {
         return (Observation(0, 0, 0), false);
     }
 
-    // ────────────────────────────────────────────────
-    // Core TWAP computation using ring buffer
-    // ────────────────────────────────────────────────
+    /**
+     * @notice Computes TWAP average price or returns (0, false) if unavailable/invalid
+     * @dev PAD-41: Supports Uniswap-style uint256 cumulative price wrap-around using unchecked modular delta
+     */
     function _twapPriceAvgOrZero(address tokenIn, address tokenOut, uint32 window)
         internal
         view
@@ -365,18 +402,21 @@ contract ParagonOracle is Ownable {
         (Observation memory startObs, bool haveObs) = _selectObservation(pair, nowTs, required);
         if (!haveObs) return (FixedPoint.uq112x112(0), false);
 
-        // Monotonicity check
-        if (p0 < startObs.price0Cumulative || p1 < startObs.price1Cumulative) {
-            return (FixedPoint.uq112x112(0), false);
-        }
-
         uint32 elapsed = nowTs - startObs.timestamp;
         if (elapsed == 0 || elapsed < required) return (FixedPoint.uq112x112(0), false);
 
         (address token0, ) = sortTokens(tokenIn, tokenOut);
 
-        uint256 p0Avg = (p0 - startObs.price0Cumulative) / elapsed;
-        uint256 p1Avg = (p1 - startObs.price1Cumulative) / elapsed;
+        // PAD-41: allow Uniswap-style uint256 cumulative wraparound (mod 2^256)
+        uint256 p0Delta;
+        uint256 p1Delta;
+        unchecked {
+            p0Delta = p0 - startObs.price0Cumulative;
+            p1Delta = p1 - startObs.price1Cumulative;
+        }
+
+        uint256 p0Avg = p0Delta / elapsed;
+        uint256 p1Avg = p1Delta / elapsed;
 
         if (p0Avg > type(uint224).max || p1Avg > type(uint224).max) {
             return (FixedPoint.uq112x112(0), false);
@@ -389,6 +429,9 @@ contract ParagonOracle is Ownable {
         return (priceAvg, true);
     }
 
+    // ────────────────────────────────────────────────
+    // PAD-40: overflow-safe TWAP out (return 0 instead of revert)
+    // ────────────────────────────────────────────────
     function _twapOutOrZero(address tokenIn, address tokenOut, uint256 amountIn, uint32 window)
         internal
         view
@@ -396,11 +439,18 @@ contract ParagonOracle is Ownable {
     {
         (FixedPoint.uq112x112 memory priceAvg, bool ok) = _twapPriceAvgOrZero(tokenIn, tokenOut, window);
         if (!ok) return 0;
-        return priceAvg.mulDecode(amountIn);
+
+        uint256 x = uint256(priceAvg._x);
+        if (x == 0 || amountIn == 0) return 0;
+
+        // Prevent overflow in extreme cases (very high TWAP price × large amountIn)
+        if (amountIn > type(uint256).max / x) return 0;
+
+        return (x * amountIn) >> RESOLUTION;
     }
 
     // ────────────────────────────────────────────────
-    // Public TWAP wrappers
+    // TWAP public helpers (restored)
     // ────────────────────────────────────────────────
     function getTwapAmountOut(uint256 amountIn, address tokenIn, address tokenOut, uint32 minTimeWindow)
         public
@@ -439,13 +489,19 @@ contract ParagonOracle is Ownable {
         (FixedPoint.uq112x112 memory priceAvg, bool ok) = _twapPriceAvgOrZero(tokenIn, tokenOut, defaultTwapTimeWindow);
         if (!ok || priceAvg._x == 0) revert NoObservation();
 
-        uint256 numerator = amountOut * (uint256(1) << 112);
-        amountIn = (numerator + uint256(priceAvg._x) - 1) / uint256(priceAvg._x);
+        uint256 x = uint256(priceAvg._x);
+        uint256 shift = uint256(1) << RESOLUTION;
+
+        // Prevent overflow before multiplication
+        if (amountOut > type(uint256).max / shift) revert NoObservation();
+        uint256 numerator = amountOut * shift;
+
+        amountIn = (numerator + x - 1) / x;
         if (amountIn == 0) revert NoObservation();
     }
 
     // ────────────────────────────────────────────────
-    // Price validation & View helpers
+    // Price validation & View helpers (restored)
     // ────────────────────────────────────────────────
     function validateOraclePrice(
         uint256 amountIn,
@@ -508,15 +564,19 @@ contract ParagonOracle is Ownable {
     }
 
     // ────────────────────────────────────────────────
-    // USD helpers
+    // USD helpers (internal)  (PAD-43 FIX APPLIED)
     // ────────────────────────────────────────────────
     function _usdPrice1e18(address token, address usdt, address wbnb) internal view returns (uint256) {
         if (token == address(0) || usdt == address(0) || wbnb == address(0)) return 0;
+
+        // PAD-43 nice-to-have: if token is USDT itself, it's $1 (scaled to 1e18)
+        if (token == usdt) return 1e18;
 
         if (adminPriceEnabled[token] && adminUsdPrice1e18[token] > 0) {
             return adminUsdPrice1e18[token];
         }
 
+        // Chainlink path is normalized to 1e18 already
         if (chainlinkFeeds[token] != address(0)) {
             uint256 p = uint256(getChainlinkPrice(token));
             uint8 fd = AggregatorV3Interface(chainlinkFeeds[token]).decimals();
@@ -528,12 +588,18 @@ contract ParagonOracle is Ownable {
         uint8 dec = _safeTokenDecimals(token);
         uint256 one = 10 ** uint256(dec);
 
+        // TWAP into USDT: result is in USDT smallest units -> normalize to 1e18 (PAD-43)
         uint256 outUsdt = _twapOutOrZero(token, usdt, one, defaultTwapTimeWindow);
-        if (outUsdt > 0) return outUsdt;
+        if (outUsdt > 0) {
+            uint8 usdtDec = _safeTokenDecimals(usdt);
+            return _to1e18(outUsdt, usdtDec);
+        }
 
+        // Else: TWAP into WBNB (result is in WBNB smallest units)
         uint256 outWbnb = _twapOutOrZero(token, wbnb, one, defaultTwapTimeWindow);
         if (outWbnb == 0) return 0;
 
+        // If we have WBNB/USD feed, convert WBNB units -> USD 1e18
         if (chainlinkFeeds[wbnb] != address(0)) {
             uint256 wUsd = uint256(getChainlinkPrice(wbnb));
             uint8 fdbn = AggregatorV3Interface(chainlinkFeeds[wbnb]).decimals();
@@ -543,11 +609,21 @@ contract ParagonOracle is Ownable {
             return Math.mulDiv(outWbnb, wUsd, 10 ** uint256(wDec));
         }
 
-        return _twapOutOrZero(wbnb, usdt, outWbnb, defaultTwapTimeWindow);
+        // Else: convert WBNB -> USDT via TWAP (result in USDT smallest units) then normalize to 1e18 (PAD-43)
+        uint256 wbnbToUsdt = _twapOutOrZero(wbnb, usdt, outWbnb, defaultTwapTimeWindow);
+        if (wbnbToUsdt == 0) return 0;
+
+        uint8 usdtDec2 = _safeTokenDecimals(usdt);
+        return _to1e18(wbnbToUsdt, usdtDec2);
     }
 
+    // ────────────────────────────────────────────────
+    // PAD-42: Public USD helpers WITH validation
+    // ────────────────────────────────────────────────
     function priceUsd1e18(address token, address usdt, address wbnb) external view returns (uint256) {
-        return _usdPrice1e18(token, usdt, wbnb);
+        _validateBases(usdt, wbnb);
+        // use canonical tokens (even though validated) for clarity
+        return _usdPrice1e18(token, usdtToken, wbnbToken);
     }
 
     function valueUsd1e18(address token, uint256 amountIn, address usdt, address wbnb)
@@ -555,7 +631,8 @@ contract ParagonOracle is Ownable {
         view
         returns (uint256)
     {
-        uint256 p = _usdPrice1e18(token, usdt, wbnb);
+        _validateBases(usdt, wbnb);
+        uint256 p = _usdPrice1e18(token, usdtToken, wbnbToken);
         if (p == 0) return 0;
         uint8 dec = _safeTokenDecimals(token);
         return Math.mulDiv(amountIn, p, 10 ** uint256(dec));
