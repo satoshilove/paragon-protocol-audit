@@ -106,6 +106,12 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     // PAD-24: explicit ops visibility
     event AutoYieldCallerUpdated(address indexed caller, bool allowed);
 
+    // PAD-51: DAO handover event
+    event DaoOwnershipTransferred(address indexed oldOwner, address indexed dao);
+
+    // Required by your requested function (kept simple)
+    event RoleAdminSynced(address indexed oldOwner, address indexed dao);
+
     constructor(
         address initialOwner,
         IERC20 _rewardToken,
@@ -140,6 +146,27 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    // ────────────────────────────── DAO Handover (PAD-51) ──────────────────────────────
+
+    function transferToDAO(address dao) external onlyOwner {
+        require(dao != address(0), "zero dao");
+        address oldOwner = owner();
+
+        // transfer ownership
+        super.transferOwnership(dao);
+
+        // sync admin role
+        if (!hasRole(DEFAULT_ADMIN_ROLE, dao)) {
+            _grantRole(DEFAULT_ADMIN_ROLE, dao);
+        }
+        if (oldOwner != dao && hasRole(DEFAULT_ADMIN_ROLE, oldOwner)) {
+            _revokeRole(DEFAULT_ADMIN_ROLE, oldOwner);
+        }
+
+        emit DaoOwnershipTransferred(oldOwner, dao);
+        emit RoleAdminSynced(oldOwner, dao);
     }
 
     // ────────────────────────────── Admin Functions ──────────────────────────────

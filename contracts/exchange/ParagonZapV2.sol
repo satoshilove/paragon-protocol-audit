@@ -350,15 +350,20 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (p.tokenIn == address(0)) {
             uint256 wBal = IERC20(WNATIVE).balanceOf(address(this));
             if (wBal > 0) {
-                if (p.recipient.code.length == 0) {
-                    IWrappedNative(WNATIVE).withdraw(wBal);
-                    (bool ok,) = p.recipient.call{value: wBal}("");
-                    require(ok, "native refund");
-                } else {
+                // unwrap to native first
+                IWrappedNative(WNATIVE).withdraw(wBal);
+
+                // try native refund to recipient (EOA or contract)
+                (bool ok,) = p.recipient.call{value: wBal}("");
+
+                if (!ok) {
+                    // if recipient rejects native, re-wrap and send WNATIVE instead
+                    IWrappedNative(WNATIVE).deposit{value: wBal}();
                     IERC20(WNATIVE).safeTransfer(p.recipient, wBal);
                 }
             }
         }
+
 
         emit ZapExecuted(
             msg.sender,
