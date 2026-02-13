@@ -74,6 +74,7 @@ interface IWrappedNative is IERC20 {
 /// @title ParagonZapV2 - Router fee-synced zap
 /// @notice Zaps tokens/native into LPs and optionally stakes; FOT tokens not supported
 /// @dev FOT (fee-on-transfer) tokens are NOT supported and will revert
+/// @dev PAD-52: Refunds/dust are returned to the payer (msg.sender) and native refunds revert on failure (no WNATIVE fallback)
 contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -92,14 +93,15 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     error TokenNotRescuable();
     error UnexpectedMsgValue();
     error ZeroRecipient();
-    error InvalidCommitment();        // PAD-50 (optional clarity)
-    error CommitmentMissing();        // PAD-50 (optional clarity)
-    error CommitmentAmountMismatch(); // PAD-50
+    error InvalidCommitment();
+    error CommitmentMissing();
+    error CommitmentAmountMismatch();
+    error NativeRefundFailed();     // PAD-52
 
     struct ZapParams {
         uint256 pid;
         address tokenIn;            // address(0) for native BNB
-        uint256 amountIn;           // for native: MUST equal msg.value (PAD-50). for ERC20: exact pull amount
+        uint256 amountIn;           // for native: MUST equal msg.value
         address[] pathToTokenA;
         address[] pathToTokenB;
         uint256 minLpOut;
@@ -108,7 +110,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         address referrer;
         uint256 deadline;
         bool autoStake;
-        bytes32 salt;               // required for single-sided commit/reveal
+        bytes32 salt;
     }
 
     struct ProtocolConfig {
@@ -136,9 +138,10 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     event ProtocolConfigUpdated(ProtocolConfig config);
     event EmergencyWithdraw(address indexed token, uint256 amount);
     event AutoStakeFallback(address indexed user, uint256 indexed pid, uint256 lpAmount);
-
-    // commit/reveal
     event ZapCommitted(address indexed user, bytes32 indexed commitment, uint256 blockNumber);
+
+    // PAD-52: optional transparency for refund destination
+    event DustRefunded(address indexed refundTo, address indexed token, uint256 amount);
 
     IParagonRouter public immutable router;
     IParagonFactory public immutable factory;
@@ -146,7 +149,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     address public immutable WNATIVE;
     ProtocolConfig public config;
 
-    // commitment => committedAtBlock
     mapping(bytes32 => uint256) public commitments;
     mapping(address => uint256) public referralEarnings;
 
@@ -176,36 +178,13 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
 
     receive() external payable {}
 
-    function getActiveFee() external view returns (uint256 feeBps, address recipient) {
-        try router.protocolFeeBps() returns (uint256 rBps) {
-            feeBps = rBps;
-        } catch {
-            feeBps = config.platformFeeBps;
-        }
-
-        try router.feeRecipient() returns (address rf) {
-            recipient = rf;
-        } catch {
-            recipient = config.feeRecipient;
-        }
-
-        if (recipient == address(0)) revert InvalidFeeRecipient();
-    }
-
     // ────────────────────────────────────────────────
-    // PAD-50 FIX:
-    // - Commitment must bind the real trade size.
-    // - For native: p.amountIn MUST be the committed native amount (not ignored).
-    // - For ERC20: p.amountIn is committed/pulled as before.
-    // - Store only commitment block; amount binding happens via hashing.
+    // PAD-50 & PAD-52 related changes are marked in functions
     // ────────────────────────────────────────────────
+
     function commitZap(ZapParams calldata p) external whenNotPaused {
-        // Basic amount sanity
         if (p.amountIn == 0) revert ZeroAmount();
 
-        // Native: amountIn represents the intended msg.value during reveal (PAD-50)
-        // ERC20: amountIn represents the intended pull amount
-        // No msg.value on commit, so we just hash p.amountIn either way.
         bytes32 paramsHash = _paramsHash(p);
         bytes32 commitment = keccak256(abi.encodePacked(paramsHash, p.salt, msg.sender));
         commitments[commitment] = block.number;
@@ -225,14 +204,16 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (p.slippageBps > config.maxSlippageBps) revert SlippageTooHigh();
         if (p.amountIn == 0) revert ZeroAmount();
 
-        // Strict msg.value rules (PAD-50)
+        // PAD-50: strict msg.value rules
         if (p.tokenIn == address(0)) {
-            // amountIn is now REQUIRED to equal msg.value to bind commitment to execution
             if (msg.value == 0) revert ZeroAmount();
             if (p.amountIn != msg.value) revert CommitmentAmountMismatch();
         } else {
             if (msg.value != 0) revert UnexpectedMsgValue();
         }
+
+        // PAD-52: all dust/refunds go back to the payer to avoid locking assets in recipient contracts
+        address refundTo = msg.sender;
 
         IParagonRouter _router = router;
         IParagonFarm _farm = farm;
@@ -251,24 +232,19 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
 
         bool singleSided = (tokenInNorm == token0 || tokenInNorm == token1);
 
-        // Require MEV protection for single-sided
         if (singleSided && p.salt == bytes32(0)) revert MEVProtectionActive();
 
-        // Enforce commit/reveal when salt is provided (and thus for single-sided)
         if (p.salt != bytes32(0)) {
-            bytes32 paramsHash = _paramsHash(p); // includes p.amountIn (native or token)
+            bytes32 paramsHash = _paramsHash(p);
             bytes32 commitment = keccak256(abi.encodePacked(paramsHash, p.salt, msg.sender));
-
             uint256 committedAt = commitments[commitment];
             if (committedAt == 0) revert CommitmentMissing();
             if (block.number <= committedAt + MEV_DELAY) revert MEVProtectionActive();
             delete commitments[commitment];
         }
 
-        // Pull/normalize input
         uint256 rawAmountIn;
         if (p.tokenIn == address(0)) {
-            // already validated msg.value == p.amountIn
             rawAmountIn = msg.value;
         } else {
             rawAmountIn = _pullTokenReturnAmount(p.tokenIn, msg.sender, p.amountIn);
@@ -344,26 +320,18 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
             IERC20(lpToken).safeTransfer(p.recipient, lpMinted);
         }
 
-        _returnDust(token0, token1, p.recipient);
+        // PAD-52: return dust to payer (refundTo), not recipient
+        _returnDust(token0, token1, refundTo);
 
-        // refund leftover WNATIVE (from rounding) for native zaps
+        // PAD-52: refund leftover WNATIVE (rounding) as native to payer (refundTo), revert on failure (no WNATIVE fallback)
         if (p.tokenIn == address(0)) {
             uint256 wBal = IERC20(WNATIVE).balanceOf(address(this));
             if (wBal > 0) {
-                // unwrap to native first
                 IWrappedNative(WNATIVE).withdraw(wBal);
-
-                // try native refund to recipient (EOA or contract)
-                (bool ok,) = p.recipient.call{value: wBal}("");
-
-                if (!ok) {
-                    // if recipient rejects native, re-wrap and send WNATIVE instead
-                    IWrappedNative(WNATIVE).deposit{value: wBal}();
-                    IERC20(WNATIVE).safeTransfer(p.recipient, wBal);
-                }
+                _refundNativeOrRevert(refundTo, wBal);
+                emit DustRefunded(refundTo, address(0), wBal);
             }
         }
-
 
         emit ZapExecuted(
             msg.sender,
@@ -379,15 +347,52 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     }
 
     // ────────────────────────────────────────────────
-    // PAD-50 FIX: paramsHash MUST include the amount that will be executed.
-    // For native, this is p.amountIn (and execution enforces msg.value == p.amountIn).
+    // PAD-52 helper: always send native, revert if fails (no WNATIVE fallback)
     // ────────────────────────────────────────────────
+    function _refundNativeOrRevert(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool success, ) = to.call{value: amount}("");
+        if (!success) revert NativeRefundFailed();
+    }
+
+    // PAD-52: dust returns go to refundTo (payer). If dust token is WNATIVE, unwrap and refund native.
+    function _returnDust(address token0, address token1, address refundTo) internal {
+        uint256 bal0 = IERC20(token0).balanceOf(address(this));
+        uint256 bal1 = IERC20(token1).balanceOf(address(this));
+
+        if (bal0 > 0) {
+            if (token0 == WNATIVE) {
+                IWrappedNative(WNATIVE).withdraw(bal0);
+                _refundNativeOrRevert(refundTo, bal0);
+                emit DustRefunded(refundTo, address(0), bal0);
+            } else {
+                IERC20(token0).safeTransfer(refundTo, bal0);
+                emit DustRefunded(refundTo, token0, bal0);
+            }
+        }
+
+        if (bal1 > 0) {
+            if (token1 == WNATIVE) {
+                IWrappedNative(WNATIVE).withdraw(bal1);
+                _refundNativeOrRevert(refundTo, bal1);
+                emit DustRefunded(refundTo, address(0), bal1);
+            } else {
+                IERC20(token1).safeTransfer(refundTo, bal1);
+                emit DustRefunded(refundTo, token1, bal1);
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────
+    // The rest of the contract remains unchanged
+    // ────────────────────────────────────────────────
+
     function _paramsHash(ZapParams calldata p) internal pure returns (bytes32) {
         return keccak256(
             abi.encode(
                 p.pid,
                 p.tokenIn,
-                p.amountIn,        // bound for both native and ERC20 now
+                p.amountIn,
                 p.pathToTokenA,
                 p.pathToTokenB,
                 p.minLpOut,
@@ -473,7 +478,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         uint256 feeBps
     ) internal returns (uint256 amountA, uint256 amountB) {
         bool inIs0 = (tokenInNorm == token0);
-        uint256 reserveIn = inIs0 ? uint256(r0) : uint256(r1);
+        uint256 reserveIn  = inIs0 ? uint256(r0) : uint256(r1);
         uint256 reserveOut = inIs0 ? uint256(r1) : uint256(r0);
 
         if (reserveIn == 0 || reserveOut == 0) revert InvalidPair();
@@ -646,13 +651,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         emit FeeCollected(token, amount, recipient);
     }
 
-    function _returnDust(address token0, address token1, address to) internal {
-        uint256 b0 = IERC20(token0).balanceOf(address(this));
-        uint256 b1 = IERC20(token1).balanceOf(address(this));
-        if (b0 > 0) IERC20(token0).safeTransfer(to, b0);
-        if (b1 > 0) IERC20(token1).safeTransfer(to, b1);
-    }
-
     function _applySlippage(uint256 amount, uint256 slippageBps) internal pure returns (uint256) {
         if (slippageBps == 0) return amount;
         if (slippageBps > 1000) slippageBps = 1000;
@@ -676,7 +674,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         for (uint256 pid = 0; pid < n; pid++) {
             (address lpToken, , , ) = farm.poolInfo(pid);
             if (lpToken == address(0)) continue;
-
             if (token == lpToken) revert TokenNotRescuable();
             IParagonPair p = IParagonPair(lpToken);
             if (token == p.token0() || token == p.token1()) revert TokenNotRescuable();

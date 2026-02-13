@@ -2,7 +2,7 @@
 pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/access/extensions/AccessControlEnumerable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -16,10 +16,8 @@ interface IReferralManager {
 interface IRewardDripper {
     function drip() external returns (uint256 sent);
     function pendingAccrued() external view returns (uint256);
-
     // PAD-23
     function rewardToken() external view returns (address);
-
     // PAD-36 hardening (optional but recommended)
     function minDripAmount() external view returns (uint256);
     function dripCooldownSecs() external view returns (uint64);
@@ -32,15 +30,12 @@ interface IRewardDripper {
  * @dev Design choice: LP tokens must be standard ERC20 (no fee-on-transfer / rebasing). This matches Pancake/Sushi
  *      MasterChef assumptions and avoids accounting ambiguity (PAD-07).
  */
-contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausable {
+contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
-
-    // PAD-24 FIX: support multiple authorized router-like callers (Router + Zap + future modules)
     bytes32 public constant AUTOYIELD_CALLER_ROLE = keccak256("AUTOYIELD_CALLER_ROLE");
 
-    // PAD-10: high precision to prevent zero-accumulation when reward token decimals are small vs LP supply
     uint256 public constant PRECISION_FACTOR = 1e30;
 
     struct UserInfo {
@@ -67,7 +62,6 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
 
     IReferralManager public referralManager;
 
-    // PAD-24: keep autoYieldDeposited tracking, but remove single autoYieldRouter limitation
     mapping(uint256 pid => mapping(address user => uint256)) public autoYieldDeposited;
 
     bool public emissionsPaused;
@@ -76,7 +70,7 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     uint256 public lowWaterDays = 3;
     uint64 public dripCooldownSecs = 900; // 15 min
     uint64 public lastDripAt;
-    uint256 public minDripAmount; // Dynamically set in constructor (PAD-20)
+    uint256 public minDripAmount;
 
     uint16 public constant MAX_PERF_FEE_BIPS = 500; // 5.00%
     address public feeRecipient;
@@ -85,7 +79,6 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     PoolInfo[] public poolInfo;
     mapping(uint256 pid => mapping(address user => UserInfo)) public userInfo;
 
-    // Cached total of rewardToken used as LP across all pools (gas optimization)
     uint256 private totalRewardTokenStakedAsLP;
 
     // Events
@@ -102,15 +95,12 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
     event HarvestFeeTaken(address indexed user, uint256 indexed pid, uint256 feeAmount);
     event DripperPoked(uint256 sent, uint256 availableAfter);
     event DripperConfigUpdated(address dripper, uint256 lowWaterDays, uint64 cooldown, uint256 minDrip);
-
-    // PAD-24: explicit ops visibility
     event AutoYieldCallerUpdated(address indexed caller, bool allowed);
 
-    // PAD-51: DAO handover event
-    event DaoOwnershipTransferred(address indexed oldOwner, address indexed dao);
-
-    // Required by your requested function (kept simple)
-    event RoleAdminSynced(address indexed oldOwner, address indexed dao);
+    // ────────────────────────────── Ownership + Admin Role Sync (PAD-51 FIX) ──────────────────────────────
+    event OwnershipAndAdminTransferred(address indexed previousOwner, address indexed newOwner);
+    // Per-admin revoke visibility (monitoring/audit trail)
+    event ExtraAdminRevoked(address indexed revokedAdmin);
 
     constructor(
         address initialOwner,
@@ -126,16 +116,61 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         startBlock = _startBlock;
         feeRecipient = initialOwner;
 
-        // PAD-20: Dynamic minDripAmount ≈ 1000 full tokens (based on reward token decimals)
-        // Note: owner can override via setDripperConfig().
+        // PAD-20: Dynamic minDripAmount ≈ 1000 full tokens
         try IERC20Metadata(address(_rewardToken)).decimals() returns (uint8 dec) {
-            // dec is typically <= 18; if it's weirdly high, owner can override later.
             minDripAmount = 1000 * (10 ** uint256(dec));
         } catch {
-            minDripAmount = 1000 * 1e18; // fallback assuming 18 decimals
+            minDripAmount = 1000 * 1e18;
         }
 
         _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
+    }
+
+    // ────────────────────────────── Ownership Override (PAD-51) ──────────────────────────────
+
+    /**
+     * @dev Enforce strict coupling: after any ownership transfer, only the new owner holds DEFAULT_ADMIN_ROLE.
+     *      This prevents privilege fragmentation even if extra admins were previously granted manually.
+     */
+    function transferOwnership(address newOwner) public virtual override onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        address oldOwner = owner();
+
+        // Perform the standard ownership transfer
+        super.transferOwnership(newOwner);
+
+        // Grant DEFAULT_ADMIN_ROLE to newOwner if not already held
+        if (!hasRole(DEFAULT_ADMIN_ROLE, newOwner)) {
+            _grantRole(DEFAULT_ADMIN_ROLE, newOwner);
+        }
+
+        // Revoke DEFAULT_ADMIN_ROLE from all other holders (safe snapshot pattern)
+        uint256 count = getRoleMemberCount(DEFAULT_ADMIN_ROLE);
+        address[] memory revokeList = new address[](count);
+
+        // Snapshot current members (excluding newOwner)
+        for (uint256 i = 0; i < count; i++) {
+            address member = getRoleMember(DEFAULT_ADMIN_ROLE, i);
+            if (member != newOwner) {
+                revokeList[i] = member;
+            }
+        }
+
+        // Revoke from snapshot
+        for (uint256 i = 0; i < count; i++) {
+            address member = revokeList[i];
+            if (member != address(0) && member != newOwner) { // extra safety
+                _revokeRole(DEFAULT_ADMIN_ROLE, member);
+                emit ExtraAdminRevoked(member);
+            }
+        }
+
+        emit OwnershipAndAdminTransferred(oldOwner, newOwner);
+    }
+
+    // Prevent accidental renounce (recommended for governance contracts)
+    function renounceOwnership() public virtual override onlyOwner {
+        revert("Renounce ownership disabled for safety");
     }
 
     // ────────────────────────────── Guardian / Pause ──────────────────────────────
@@ -148,37 +183,15 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         _unpause();
     }
 
-    // ────────────────────────────── DAO Handover (PAD-51) ──────────────────────────────
-
-    function transferToDAO(address dao) external onlyOwner {
-        require(dao != address(0), "zero dao");
-        address oldOwner = owner();
-
-        // transfer ownership
-        super.transferOwnership(dao);
-
-        // sync admin role
-        if (!hasRole(DEFAULT_ADMIN_ROLE, dao)) {
-            _grantRole(DEFAULT_ADMIN_ROLE, dao);
-        }
-        if (oldOwner != dao && hasRole(DEFAULT_ADMIN_ROLE, oldOwner)) {
-            _revokeRole(DEFAULT_ADMIN_ROLE, oldOwner);
-        }
-
-        emit DaoOwnershipTransferred(oldOwner, dao);
-        emit RoleAdminSynced(oldOwner, dao);
-    }
-
     // ────────────────────────────── Admin Functions ──────────────────────────────
 
     function setReferralManager(address _ref) external onlyOwner {
-        require(_ref != address(0), "zero ref"); // PAD-15
+        require(_ref != address(0), "zero ref");
         referralManager = IReferralManager(_ref);
     }
 
-    // PAD-24 FIX: allow multiple authorized callers for depositFor() on behalf of users
     function setAutoYieldCaller(address caller, bool allowed) external onlyOwner {
-        require(caller != address(0), "zero caller"); // PAD-15 style
+        require(caller != address(0), "zero caller");
         if (allowed) {
             _grantRole(AUTOYIELD_CALLER_ROLE, caller);
         } else {
@@ -193,28 +206,17 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         rewardPerBlock = _rpb;
     }
 
-    /**
-     * PAD-04 FIX:
-     * - Pause: accrue up to current block, then freeze emissions.
-     * - Unpause: while still paused, advance each pool's lastRewardBlock to current block (no mint),
-     *   then resume emissions. This excludes paused blocks even if pools weren't updated during pause.
-     */
     function setEmissionsPaused(bool _paused) external onlyOwner {
         if (_paused == emissionsPaused) return;
 
         if (_paused) {
-            // Accrue rewards up to this block, then pause emissions.
             massUpdateAllPools();
             emissionsPaused = true;
             emit EmissionsPaused(true);
             return;
         }
 
-        // Resume emissions:
-        // While emissionsPaused is still true, updatePool() will NOT accrue rewards,
-        // but WILL set lastRewardBlock = block.number, excluding paused interval.
         massUpdateAllPools();
-
         emissionsPaused = false;
         emit EmissionsPaused(false);
     }
@@ -237,7 +239,6 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
 
         if (_dripper != address(0)) {
             IRewardDripper newDripper = IRewardDripper(_dripper);
-            // PAD-23: enforce reward token match
             require(newDripper.rewardToken() == address(rewardToken), "reward token mismatch");
             dripper = newDripper;
         } else {
@@ -251,21 +252,11 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         emit DripperConfigUpdated(_dripper, _days, _cooldown, _min);
     }
 
-    function massUpdateAllPools() public {
-        uint256 len = poolInfo.length;
-        for (uint256 i = 0; i < len; ++i) {
-            updatePool(i);
-        }
-    }
-
     // ────────────────────────────── Pool Management ──────────────────────────────
 
     function addPool(uint256 _allocPoint, IERC20 _lpToken, uint256 _harvestDelay) external onlyOwner {
-        require(address(_lpToken) != address(0), "zero lpToken"); // PAD-15
-
-        // ────────────────────────────────────────────────
+        require(address(_lpToken) != address(0), "zero lpToken");
         require(poolInfo.length < 300, "Maximum number of pools reached");
-        // ────────────────────────────────────────────────
 
         massUpdateAllPools();
         totalAllocPoint += _allocPoint;
@@ -300,14 +291,12 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         if (address(dripper) == address(0) || emissionsPaused || rewardPerBlock == 0) return;
         if (block.timestamp < lastDripAt + dripCooldownSecs) return;
 
-        uint256 need = rewardPerBlock * 115200 * lowWaterDays; // ~2 blocks/sec assumption used earlier
+        uint256 need = rewardPerBlock * 115200 * lowWaterDays;
         if (_availableRewards() >= need) return;
 
-        // best-effort; ignore failures
         try dripper.pendingAccrued() returns (uint256 p) {
             if (p >= minDripAmount) {
                 try dripper.drip() returns (uint256 sent) {
-                    // ✅ PAD-36 FIX: only set cooldown timestamp if tokens were actually transferred
                     if (sent > 0) {
                         lastDripAt = uint64(block.timestamp);
                     }
@@ -321,7 +310,14 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         _maybeTopUpFromDripper();
     }
 
-    // ────────────────────────────── Core Accounting ──────────────────────────────
+    // ────────────────────────────── Core Functions ──────────────────────────────
+
+    function massUpdateAllPools() public {
+        uint256 len = poolInfo.length;
+        for (uint256 i = 0; i < len; ++i) {
+            updatePool(i);
+        }
+    }
 
     function updatePool(uint256 _pid) public {
         _maybeTopUpFromDripper();
@@ -337,13 +333,11 @@ contract ParagonFarmController is Ownable, AccessControl, ReentrancyGuard, Pausa
         uint256 blocks = block.number - pool.lastRewardBlock;
         uint256 reward = (blocks * rewardPerBlock * pool.allocPoint) / totalAllocPoint;
         if (reward > 0) {
-            pool.accRewardPerShare += (reward * PRECISION_FACTOR) / lpSupply; // PAD-10
+            pool.accRewardPerShare += (reward * PRECISION_FACTOR) / lpSupply;
         }
 
         pool.lastRewardBlock = block.number;
     }
-
-    // ────────────────────────────── User Functions ──────────────────────────────
 
     function depositFor(
         uint256 _pid,
