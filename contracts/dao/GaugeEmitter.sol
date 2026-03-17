@@ -7,78 +7,87 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 interface IGC {
     function n_gauges() external view returns (uint256);
-    function gaugesAt(uint256) external view returns (address);
-    function gaugeWeight(address) external view returns (uint256);
-    function totalWeight() external view returns (uint256);
+    function gaugesAt(uint256 i) external view returns (address);
+    function totalWeightNow() external view returns (uint256);
+    function gaugeWeightNow(address gauge) external view returns (uint256);
+    function isGauge(address gauge) external view returns (bool);
 }
 
 contract GaugeEmitterToFarmBps is Ownable {
     using SafeERC20 for IERC20;
 
-    IERC20 public immutable reward;       // XPGN
-    IGC    public immutable controller;   // GaugeController (BPS)
-    address public farm;                  // FarmController
-    mapping(address => uint256) public poolIdOf; // gauge -> farm poolId
+    IERC20 public immutable reward;
+    IGC public immutable controller;
+    address public farm;
+
+    mapping(address => uint256) public poolIdOf;
+    mapping(address => bool) public isGaugeMapped;
 
     event FarmSet(address farm);
     event GaugeMapped(address gauge, uint256 poolId);
     event Notified(uint256 weekTs, uint256 amount);
 
     constructor(address _reward, address _controller, address _farm, address _owner) Ownable(_owner) {
-        require(_reward != address(0) && _controller != address(0) && _farm != address(0) && _owner != address(0), "Emitter: zero");
+        require(_reward != address(0) && _controller != address(0) && _farm != address(0) && _owner != address(0), "bad args");
         reward = IERC20(_reward);
         controller = IGC(_controller);
         farm = _farm;
     }
 
     function setFarm(address f) external onlyOwner {
-        require(f != address(0), "Emitter: farm=0");
+        require(f != address(0), "farm=0");
         farm = f;
         emit FarmSet(f);
     }
 
     function setPoolId(address gauge, uint256 pid) external onlyOwner {
-        require(gauge != address(0), "Emitter: gauge=0");
+        require(gauge != address(0), "g=0");
         poolIdOf[gauge] = pid;
+        isGaugeMapped[gauge] = true;
         emit GaugeMapped(gauge, pid);
     }
 
-    /// @notice Treasury/owner calls this weekly after giving allowance to this contract.
-    /// @dev Distributes `amount` across gauges pro-rata by controller BPS weight.
-    ///      Any integer-division dust remains in this contract (unchanged from original behavior).
     function notifyRewardAmount(uint256 weekTs, uint256 amount) external onlyOwner {
         reward.safeTransferFrom(msg.sender, address(this), amount);
 
-        uint256 tot = controller.totalWeight();
+        uint256 tot = controller.totalWeightNow();
         require(tot > 0, "no weights");
 
         uint256 n = controller.n_gauges();
-        for (uint256 i = 0; i < n; i++) {
+        uint256 allocated;
+
+        for (uint256 i = 0; i < n; ++i) {
             address g = controller.gaugesAt(i);
-            uint256 w = controller.gaugeWeight(g);
+            if (!controller.isGauge(g)) continue;
+            if (!isGaugeMapped[g]) continue;
+
+            uint256 w = controller.gaugeWeightNow(g);
             if (w == 0) continue;
-
-            uint256 pid = poolIdOf[g];
-
-            // NOTE: This preserves the original semantics: if mapping is unset and pid == 0,
-            // the gauge is skipped. If your farm uses poolId=0 as a valid pool, this will also
-            // skip it (matching the original behavior).
-            if (pid == 0 && poolIdOf[g] == 0) continue;
 
             uint256 share = (amount * w) / tot;
             if (share == 0) continue;
 
-            // push tokens to farm
+            allocated += share;
             reward.safeTransfer(farm, share);
 
-            // notify farm (try two common signatures)
-            (bool ok, ) = farm.call(abi.encodeWithSignature("notifyRewardAmount(uint256,uint256)", pid, share));
+            uint256 pid = poolIdOf[g];
+            (bool ok,) = farm.call(
+                abi.encodeWithSignature("notifyRewardAmount(uint256,uint256)", pid, share)
+            );
+
             if (!ok) {
-                (ok, ) = farm.call(abi.encodeWithSignature("notifyRewardAmount(uint256,address,uint256)", pid, address(reward), share));
+                (ok,) = farm.call(
+                    abi.encodeWithSignature(
+                        "notifyRewardAmount(uint256,address,uint256)",
+                        pid,
+                        address(reward),
+                        share
+                    )
+                );
                 require(ok, "farm notify failed");
             }
         }
 
-        emit Notified(weekTs, amount);
+        emit Notified(weekTs, allocated);
     }
 }

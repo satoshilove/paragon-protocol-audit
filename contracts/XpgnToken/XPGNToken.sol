@@ -55,7 +55,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     // -----------------------------------------------------------------------
 
     bytes32 public constant GENESIS_MINTER_ROLE      = keccak256("GENESIS_MINTER_ROLE");      // Genesis liquidity/MM reserve (up to 10M incl. seed)
-    bytes32 public constant FARMING_MINTER_ROLE      = keccak256("FARMING_MINTER_ROLE");      // farms / gauges (MasterChef / gauges)
+    bytes32 public constant FARMING_MINTER_ROLE      = keccak256("FARMING_MINTER_ROLE");      // farming emissions funded by multisig into RewardDripperEscrow / gauges
     bytes32 public constant VALIDATOR_MINTER_ROLE    = keccak256("VALIDATOR_MINTER_ROLE");    // validator / chain reserve distributor
     bytes32 public constant ECOSYSTEM_MINTER_ROLE    = keccak256("ECOSYSTEM_MINTER_ROLE");    // ecosystem / partners / grants (streamed)
     bytes32 public constant TREASURY_MINTER_ROLE     = keccak256("TREASURY_MINTER_ROLE");     // DAO & Treasury ops (buybacks, POL, incentives)
@@ -126,15 +126,13 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
     // Constructor
     // -----------------------------------------------------------------------
 
-    /// @param daoMultisig      DAO multisig / admin (DEFAULT_ADMIN_ROLE holder)
-    /// @param masterChef       farming controller (ParagonFarmController / gauges)
+    /// @param daoMultisig      Dev multisig / future DAO multisig admin (DEFAULT_ADMIN_ROLE holder)
     /// @param validatorRewards validator reserve distributor contract
     /// @param _teamVesting     team vesting contract (enforced recipient)
     /// @param _advisorVesting  advisor vesting contract (enforced recipient)
     /// @param genesisRecipient recipient of 202,020 genesis liquidity (DEX seed)
     constructor(
         address daoMultisig,
-        address masterChef,
         address validatorRewards,
         address _teamVesting,
         address _advisorVesting,
@@ -145,7 +143,6 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
         ERC20Permit("XPGN Token")
     {
         require(daoMultisig      != address(0), "INVALID_DAO_MULTISIG");
-        require(masterChef       != address(0), "INVALID_MASTERCHEF");
         require(validatorRewards != address(0), "INVALID_VALIDATOR_REWARDS");
         require(_teamVesting     != address(0), "INVALID_TEAM_VESTING");
         require(_advisorVesting  != address(0), "INVALID_ADVISOR_VESTING");
@@ -159,7 +156,7 @@ contract XPGNToken is ERC20Capped, ERC20Permit, ERC20Votes, AccessControlEnumera
         // - Start with daoMultisig holding GENESIS + TREASURY + other admin roles.
         // - Later, DAO governance can be granted roles and the multisig can revoke itself.
         _grantRole(GENESIS_MINTER_ROLE,      daoMultisig);
-        _grantRole(FARMING_MINTER_ROLE,      masterChef);
+        _grantRole(FARMING_MINTER_ROLE,      daoMultisig);
         _grantRole(VALIDATOR_MINTER_ROLE,    validatorRewards);
         _grantRole(ECOSYSTEM_MINTER_ROLE,    daoMultisig);
         _grantRole(TREASURY_MINTER_ROLE,     daoMultisig);

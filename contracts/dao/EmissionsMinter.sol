@@ -10,13 +10,13 @@ import {IMintable} from "./interfaces/IMintable.sol";
 interface IGaugeControllerLite {
     function n_gauges() external view returns (uint256);
     function gaugesAt(uint256 i) external view returns (address);
-    function totalWeight() external view returns (uint256);
-    function gaugeWeight(address gauge) external view returns (uint256);
+    function totalWeightNow() external view returns (uint256);
+    function gaugeWeightNow(address gauge) external view returns (uint256);
+    function isGauge(address gauge) external view returns (bool);
 }
 
 interface ISimpleGauge {
     function notifyRewardAmount(uint256 amount) external;
-    function rewardToken() external view returns (address);
 }
 
 contract EmissionsMinter is Ownable, ReentrancyGuard {
@@ -24,14 +24,14 @@ contract EmissionsMinter is Ownable, ReentrancyGuard {
 
     uint256 public constant WEEK = 7 days;
 
-    IERC20 public immutable token;              // XPGN
+    IERC20 public immutable token;
     IGaugeControllerLite public controller;
 
-    address public treasury;                    // optional funding source (pull mode)
-    bool    public useMinting = true;           // true => mint; false => transferFrom(treasury)
+    address public treasury;
+    bool public useMinting = true;
 
-    uint256 public weeklyEmission;              // amount per week
-    uint256 public lastPushedWeek;              // week timestamp of last push
+    uint256 public weeklyEmission;
+    uint256 public lastPushedWeek;
 
     event SetWeeklyEmission(uint256 amount);
     event Pushed(uint256 weekTs, uint256 total, uint256 gauges);
@@ -39,7 +39,7 @@ contract EmissionsMinter is Ownable, ReentrancyGuard {
     event ControllerSet(address controller);
 
     constructor(address _token, address _controller, address initialOwner) Ownable(initialOwner) {
-        require(_token != address(0) && _controller != address(0), "Minter: zero");
+        require(_token != address(0) && _controller != address(0), "bad args");
         token = IERC20(_token);
         controller = IGaugeControllerLite(_controller);
     }
@@ -50,18 +50,18 @@ contract EmissionsMinter is Ownable, ReentrancyGuard {
     }
 
     function setFundingMode(bool _useMinting, address _treasury) external onlyOwner {
+        if (!_useMinting) require(_treasury != address(0), "treasury=0");
         useMinting = _useMinting;
         treasury = _treasury;
         emit SetFundingMode(_useMinting, _treasury);
     }
 
     function setController(address c) external onlyOwner {
-        require(c != address(0), "Minter: zero");
+        require(c != address(0), "controller=0");
         controller = IGaugeControllerLite(c);
         emit ControllerSet(c);
     }
 
-    /// @notice Push this week's emission to all gauges, pro-rata by gauge weight.
     function kick() external nonReentrant {
         require(weeklyEmission > 0, "emission=0");
 
@@ -71,37 +71,54 @@ contract EmissionsMinter is Ownable, ReentrancyGuard {
         uint256 n = controller.n_gauges();
         require(n > 0, "no gauges");
 
-        uint256 tw = controller.totalWeight();
+        uint256 tw = controller.totalWeightNow();
         require(tw > 0, "no weight");
 
-        // Effects first (reentrancy safety): mark week as pushed
-        lastPushedWeek = weekTs;
+        address[] memory gaugeList = new address[](n);
+        uint256[] memory amtList = new uint256[](n);
 
-        // Fund this minter
-        if (useMinting) {
-            IMintable(address(token)).mint(address(this), weeklyEmission);
-        } else {
-            require(treasury != address(0), "treasury=0");
-            token.safeTransferFrom(treasury, address(this), weeklyEmission);
-        }
+        uint256 realCount;
+        uint256 allocated;
 
-        // Distribute by weights (integer division leaves harmless dust in the minter)
-        for (uint256 i = 0; i < n; i++) {
+        for (uint256 i = 0; i < n; ++i) {
             address g = controller.gaugesAt(i);
-            uint256 gw = controller.gaugeWeight(g);
+            if (!controller.isGauge(g)) continue;
+
+            uint256 gw = controller.gaugeWeightNow(g);
             if (gw == 0) continue;
 
             uint256 amt = (weeklyEmission * gw) / tw;
             if (amt == 0) continue;
 
-            // Approve gauge to pull just this amount; forceApprove handles non-standard ERC-20s
-            token.forceApprove(g, amt);
-
-            // External call: gauge pulls `amt` via transferFrom (per SimpleGauge pattern)
-            ISimpleGauge(g).notifyRewardAmount(amt);
+            gaugeList[realCount] = g;
+            amtList[realCount] = amt;
+            allocated += amt;
+            realCount++;
         }
 
-        emit Pushed(weekTs, weeklyEmission, n);
+        require(realCount > 0, "no alloc");
+
+        lastPushedWeek = weekTs;
+
+        if (useMinting) {
+            IMintable(address(token)).mint(address(this), weeklyEmission);
+        } else {
+            token.safeTransferFrom(treasury, address(this), weeklyEmission);
+        }
+
+        for (uint256 i = 0; i < realCount; ++i) {
+            token.forceApprove(gaugeList[i], 0);
+            token.forceApprove(gaugeList[i], amtList[i]);
+            ISimpleGauge(gaugeList[i]).notifyRewardAmount(amtList[i]);
+        }
+
+        emit Pushed(weekTs, allocated, realCount);
+    }
+
+    function rescueDust(address to) external onlyOwner {
+        require(to != address(0), "to=0");
+        uint256 dust = token.balanceOf(address(this));
+        if (dust > 0) token.safeTransfer(to, dust);
     }
 
     function _roundDownWeek(uint256 t) internal pure returns (uint256) {

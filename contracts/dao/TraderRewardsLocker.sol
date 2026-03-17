@@ -6,41 +6,36 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IVoterEscrowLocking} from "./interfaces/IVoterEscrowLocking.sol";
 
-interface IUsagePointsView {
+interface IUsagePointsLockerView {
     function pointsOf(address user, uint256 epoch) external view returns (uint256);
     function totalOf(uint256 epoch) external view returns (uint256);
+    function currentEpoch() external view returns (uint256);
 }
 
-interface IVoterEscrowLike {
-    // Preferred: create_lock_for(to, amount, unlock_time)
-    function create_lock_for(address to, uint256 amount, uint256 unlock_time) external returns (uint256 tokenId);
-    // Solidly order fallback: create_lock_for(amount, unlock_time, to)
-    function create_lock_for(uint256 amount, uint256 unlock_time, address to) external returns (uint256 tokenId);
-}
-
-/// @title TraderRewardsLocker — turns weekly trade rewards into **auto-locked ve**
 contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    IERC20 public immutable XPGN;
-    IUsagePointsView public immutable usage;
-    IVoterEscrowLike public immutable ve;
+    uint256 public constant WEEK = 7 days;
 
-    // Switch for signature order
+    IERC20 public immutable XPGN;
+    IUsagePointsLockerView public immutable usage;
+    IVoterEscrowLocking public immutable ve;
+
     bool public immutable useSolidlyOrder;
 
-    // epoch => funded amount
     mapping(uint256 => uint256) public epochBudget;
-    // epoch => user => claimed?
+    mapping(uint256 => bool) public epochFinalized;
+    mapping(uint256 => uint256) public epochFinalTotalPoints;
     mapping(uint256 => mapping(address => bool)) public claimed;
 
-    // Lock config
-    uint256 public minLockWeeks = 52;     // 1 year default
-    uint256 public maxLockWeeks = 208;    // 4 years cap (safety)
-    uint16  public gasKickbackBips = 0;   // optional % paid to wallet (unlocked), default 0
+    uint256 public minLockWeeks = 52;
+    uint256 public maxLockWeeks = 208;
+    uint16 public gasKickbackBips = 0;
 
     event BudgetNotified(uint256 indexed epoch, uint256 amount, address indexed from);
+    event EpochFinalized(uint256 indexed epoch, uint256 totalPoints);
     event Claimed(
         uint256 indexed epoch,
         address indexed user,
@@ -61,12 +56,10 @@ contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
     ) Ownable(_owner) {
         require(_xpgn != address(0) && _usagePoints != address(0) && _ve != address(0), "zero addr");
         XPGN = IERC20(_xpgn);
-        usage = IUsagePointsView(_usagePoints);
-        ve = IVoterEscrowLike(_ve);
+        usage = IUsagePointsLockerView(_usagePoints);
+        ve = IVoterEscrowLocking(_ve);
         useSolidlyOrder = _useSolidlyOrder;
     }
-
-    // --- Admin ---
 
     function setLockConfig(uint256 _minWeeks, uint256 _maxWeeks, uint16 _kickbackBips) external onlyOwner {
         require(_minWeeks >= 1 && _maxWeeks >= _minWeeks && _maxWeeks <= 208, "bad weeks");
@@ -77,35 +70,53 @@ contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
         emit LockConfig(_minWeeks, _maxWeeks, _kickbackBips);
     }
 
-    function pause() external onlyOwner { _pause(); }
-    function unpause() external onlyOwner { _unpause(); }
+    function pause() external onlyOwner {
+        _pause();
+    }
 
-    /// @notice Fund a specific epoch. Treasury must `approve` this contract beforehand.
-    function notifyRewardAmount(uint256 epoch, uint256 amount) external whenNotPaused {
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function notifyRewardAmount(uint256 epoch, uint256 amount) external onlyOwner whenNotPaused {
         require(amount > 0, "amount=0");
         XPGN.safeTransferFrom(msg.sender, address(this), amount);
         epochBudget[epoch] += amount;
         emit BudgetNotified(epoch, amount, msg.sender);
     }
 
-    /// @notice Claim and auto-lock caller’s share for an epoch.
+    /// @notice Finalize only after epoch closes.
+    /// @dev Fixes early-claim / undercount exploit class flagged by audit.
+    function finalizeEpoch(uint256 epoch) public whenNotPaused {
+        require(epoch < usage.currentEpoch(), "epoch not closed");
+        require(!epochFinalized[epoch], "already finalized");
+
+        uint256 totalPts = usage.totalOf(epoch);
+        epochFinalized[epoch] = true;
+        epochFinalTotalPoints[epoch] = totalPts;
+
+        emit EpochFinalized(epoch, totalPts);
+    }
+
+    function batchFinalize(uint256[] calldata epochs) external whenNotPaused {
+        for (uint256 i = 0; i < epochs.length; ++i) {
+            if (!epochFinalized[epochs[i]]) {
+                finalizeEpoch(epochs[i]);
+            }
+        }
+    }
+
     function claim(uint256 epoch) external nonReentrant whenNotPaused {
         _claimTo(epoch, msg.sender, msg.sender);
     }
 
-    /// @notice Relayed claim to a receiver (e.g., for sponsors).
-    function claimFor(uint256 epoch, address account, address receiver) external nonReentrant whenNotPaused {
-        require(account != address(0) && receiver != address(0), "zero");
-        _claimTo(epoch, account, receiver);
-    }
-
-    // --- Internals ---
-
     function _claimTo(uint256 epoch, address account, address receiver) internal {
+        require(msg.sender == account, "only self claim");
         require(!claimed[epoch][account], "already claimed");
+        require(epochFinalized[epoch], "epoch not finalized");
 
         uint256 pts = usage.pointsOf(account, epoch);
-        uint256 tot = usage.totalOf(epoch);
+        uint256 tot = epochFinalTotalPoints[epoch];
         require(pts > 0 && tot > 0, "no points");
 
         uint256 budget = epochBudget[epoch];
@@ -114,25 +125,20 @@ contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
         uint256 share = (budget * pts) / tot;
         require(share > 0, "dust");
 
-        // Mark claimed BEFORE external calls
         claimed[epoch][account] = true;
 
-        // Optional small kickback
         uint256 kick = (share * gasKickbackBips) / 10_000;
         uint256 lockAmt = share - kick;
 
-        // Pay kickback
         if (kick > 0) {
             XPGN.safeTransfer(receiver, kick);
         }
 
-        // Approve ve and create lock
         XPGN.forceApprove(address(ve), 0);
         XPGN.forceApprove(address(ve), lockAmt);
 
-        // Align unlock to week boundary (ceil), clamp to max
-        uint256 targetMin = block.timestamp + (minLockWeeks * 1 weeks);
-        uint256 targetMax = block.timestamp + (maxLockWeeks * 1 weeks);
+        uint256 targetMin = block.timestamp + (minLockWeeks * WEEK);
+        uint256 targetMax = block.timestamp + (maxLockWeeks * WEEK);
 
         uint256 unlockTime = _ceilToWeek(targetMin);
         uint256 maxUnlock = _ceilToWeek(targetMax);
@@ -140,17 +146,13 @@ contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
 
         uint256 tokenId;
         if (useSolidlyOrder) {
-            // ve.create_lock_for(uint256 amount, uint256 unlock_time, address to)
             tokenId = ve.create_lock_for(lockAmt, unlockTime, receiver);
         } else {
-            // ve.create_lock_for(address to, uint256 amount, uint256 unlock_time)
             tokenId = ve.create_lock_for(receiver, lockAmt, unlockTime);
         }
 
         emit Claimed(epoch, receiver, share, lockAmt, unlockTime, tokenId);
     }
-
-    // --- Safety ---
 
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
         require(to != address(0), "zero");
@@ -158,10 +160,7 @@ contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
         emit EmergencyWithdraw(token, to, amount);
     }
 
-    // --- Utils ---
-
     function _ceilToWeek(uint256 t) internal pure returns (uint256) {
-        uint256 WEEK = 1 weeks;
         return ((t + WEEK - 1) / WEEK) * WEEK;
     }
 }

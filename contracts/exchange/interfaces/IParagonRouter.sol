@@ -2,178 +2,190 @@
 pragma solidity ^0.8.25;
 
 interface IParagonRouter {
-    // -------- Core addresses --------
+    // -------- Core / Immutable addresses --------
     function factory() external view returns (address);
     function WNative() external view returns (address);
+
 
     // -------- Auto-yield config --------
     function autoYieldPid() external view returns (uint256);
     function autoYieldEnabled() external view returns (bool);
+    function userAutoYieldBips(address user) external view returns (uint8);
+
+    // -------- Admin / Configuration functions --------
+    function setAdmin(address admin) external;
+    function setGuard(address guard) external;
     function setAutoYieldConfig(uint256 pid, bool enabled) external;
 
-    // -------- Events (single source of truth) --------
+    // -------- Events --------
+    event AdminUpdated(address indexed admin);
+    event GuardUpdated(address indexed guard);
     event AutoYieldConfigUpdated(uint256 pid, bool enabled);
+    event AutoYieldPreferenceSet(address indexed user, uint8 bips);
     event AutoYieldStaked(address indexed user, uint256 yieldAmount, uint8 percent);
     event AutoYieldFailed(address indexed user, uint256 yieldAmount, uint8 percent);
 
-    event OracleUpdated(address indexed oracle);
-    event GuardParamsUpdated(
-        bool enabled,
-        bool useChainlink,
-        bool failOpen,
-        uint16 maxSlippageBips,
-        uint16 maxImpactBips
-    );
-    event ProtectedTokenSet(address indexed token, bool isProtected);
+    // -------- Quotes (view / pure) --------
+    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB)
+        external pure returns (uint256 amountB);
 
-    // -------- Quotes --------
-    function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB);
-    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external view returns (uint amountOut);
-    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) external view returns (uint amountIn);
-    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
-    function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts);
+    function getAmountOut(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) external view returns (uint256 amountOut);
 
-    // -------- Add liquidity --------
+    function getAmountIn(
+        uint256 amountOut,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) external view returns (uint256 amountIn);
+
+    function getAmountsOut(uint256 amountIn, address[] calldata path)
+        external view returns (uint256[] memory amounts);
+
+    function getAmountsIn(uint256 amountOut, address[] calldata path)
+        external view returns (uint256[] memory amounts);
+
+    // -------- Liquidity management --------
     function addLiquidity(
         address tokenA,
         address tokenB,
-        uint amountADesired,
-        uint amountBDesired,
-        uint amountAMin,
-        uint amountBMin,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
         address to,
-        uint deadline
-    ) external returns (uint amountA, uint amountB, uint liquidity);
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
 
     function addLiquidityNative(
         address token,
-        uint amountTokenDesired,
-        uint amountTokenMin,
-        uint amountNativeMin,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountNativeMin,
         address to,
-        uint deadline
-    ) external payable returns (uint amountToken, uint amountNative, uint liquidity);
+        uint256 deadline
+    ) external payable returns (uint256 amountToken, uint256 amountNative, uint256 liquidity);
 
-    // -------- Remove liquidity --------
     function removeLiquidity(
         address tokenA,
         address tokenB,
-        uint liquidity,
-        uint amountAMin,
-        uint amountBMin,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
         address to,
-        uint deadline
-    ) external returns (uint amountA, uint amountB);
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
 
     function removeLiquidityNative(
         address token,
-        uint liquidity,
-        uint amountTokenMin,
-        uint amountNativeMin,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountNativeMin,
         address to,
-        uint deadline
-    ) external returns (uint amountToken, uint amountNative);
+        uint256 deadline
+    ) external returns (uint256 amountToken, uint256 amountNative);
 
     function removeLiquidityWithPermit(
         address tokenA,
         address tokenB,
-        uint liquidity,
-        uint amountAMin,
-        uint amountBMin,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
         address to,
-        uint deadline,
+        uint256 deadline,
         bool approveMax,
         uint8 v,
         bytes32 r,
         bytes32 s
-    ) external returns (uint amountA, uint amountB);
+    ) external returns (uint256 amountA, uint256 amountB);
 
     function removeLiquidityNativeWithPermit(
         address token,
-        uint liquidity,
-        uint amountTokenMin,
-        uint amountNativeMin,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountNativeMin,
         address to,
-        uint deadline,
+        uint256 deadline,
         bool approveMax,
         uint8 v,
         bytes32 r,
         bytes32 s
-    ) external returns (uint amountToken, uint amountNative);
+    ) external returns (uint256 amountToken, uint256 amountNative);
 
-    // -------- Swaps (classic) --------
+    // -------- Standard swaps (non-FOT) --------
     function swapExactTokensForTokens(
-        uint amountIn,
-        uint amountOutMin,
+        uint256 amountIn,
+        uint256 amountOutMin,
         address[] calldata path,
         address to,
-        uint deadline,
+        uint256 deadline,
         uint8 autoYieldPercent
-    ) external returns (uint[] memory amounts);
+    ) external returns (uint256[] memory amounts);
 
     function swapTokensForExactTokens(
-        uint amountOut,
-        uint amountInMax,
+        uint256 amountOut,
+        uint256 amountInMax,
         address[] calldata path,
         address to,
-        uint deadline
-    ) external returns (uint[] memory amounts);
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
 
     function swapExactNativeForTokens(
-        uint amountOutMin,
+        uint256 amountOutMin,
         address[] calldata path,
         address to,
-        uint deadline,
+        uint256 deadline,
         uint8 autoYieldPercent
-    ) external payable returns (uint[] memory amounts);
+    ) external payable returns (uint256[] memory amounts);
 
-    // ✅ ADDED: exact-in tokens -> native (non-FOT)
     function swapExactTokensForNative(
-        uint amountIn,
-        uint amountOutMin,
+        uint256 amountIn,
+        uint256 amountOutMin,
         address[] calldata path,
         address to,
-        uint deadline
-    ) external returns (uint[] memory amounts);
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
 
     function swapTokensForExactNative(
-        uint amountOut,
-        uint amountInMax,
+        uint256 amountOut,
+        uint256 amountInMax,
         address[] calldata path,
         address to,
-        uint deadline
-    ) external returns (uint[] memory amounts);
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
 
     function swapNativeForExactTokens(
-        uint amountOut,
+        uint256 amountOut,
         address[] calldata path,
         address to,
-        uint deadline
-    ) external payable returns (uint[] memory amounts);
+        uint256 deadline
+    ) external payable returns (uint256[] memory amounts);
 
-    // -------- FOT support --------
+    // -------- Fee-on-Transfer (supporting) swaps --------
     function swapExactTokensForTokensSupportingFeeOnTransferTokens(
-        uint amountIn,
-        uint amountOutMin,
+        uint256 amountIn,
+        uint256 amountOutMin,
         address[] calldata path,
         address to,
-        uint deadline,
+        uint256 deadline,
         uint8 autoYieldPercent
-    ) external returns (uint amountOut);
+    ) external returns (uint256 amountOut);
 
     function swapExactNativeForTokensSupportingFeeOnTransferTokens(
-        uint amountOutMin,
+        uint256 amountOutMin,
         address[] calldata path,
         address to,
-        uint deadline,
+        uint256 deadline,
         uint8 autoYieldPercent
-    ) external payable returns (uint amountOut);
+    ) external payable returns (uint256 amountOut);
 
     function swapExactTokensForNativeSupportingFeeOnTransferTokens(
-        uint amountIn,
-        uint amountOutMin,
+        uint256 amountIn,
+        uint256 amountOutMin,
         address[] calldata path,
         address to,
-        uint deadline
-    ) external returns (uint amountOut);
+        uint256 deadline
+    ) external returns (uint256 amountOut);
 }

@@ -59,9 +59,23 @@ interface IParagonPair is IERC20 {
 }
 
 /// @title Farming Contract Interface
+/// @notice Updated to match live ParagonFarmController poolInfo() getter exactly
 interface IParagonFarm {
     function depositFor(uint256 pid, uint256 amount, address user, address referrer) external;
-    function poolInfo(uint256 pid) external view returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accTokenPerShare);
+
+    function poolInfo(uint256 pid)
+        external
+        view
+        returns (
+            IERC20 lpToken,
+            uint256 allocPoint,
+            uint256 lastRewardBlock,
+            uint256 accRewardPerShare,
+            uint256 harvestDelay,
+            uint256 totalStaked,
+            uint256 rewardTokenStaked
+        );
+
     function poolLength() external view returns (uint256);
 }
 
@@ -96,7 +110,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     error InvalidCommitment();
     error CommitmentMissing();
     error CommitmentAmountMismatch();
-    error NativeRefundFailed();     // PAD-52
+    error NativeRefundFailed();
 
     struct ZapParams {
         uint256 pid;
@@ -139,8 +153,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     event EmergencyWithdraw(address indexed token, uint256 amount);
     event AutoStakeFallback(address indexed user, uint256 indexed pid, uint256 lpAmount);
     event ZapCommitted(address indexed user, bytes32 indexed commitment, uint256 blockNumber);
-
-    // PAD-52: optional transparency for refund destination
     event DustRefunded(address indexed refundTo, address indexed token, uint256 amount);
 
     IParagonRouter public immutable router;
@@ -178,10 +190,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
 
     receive() external payable {}
 
-    // ────────────────────────────────────────────────
-    // PAD-50 & PAD-52 related changes are marked in functions
-    // ────────────────────────────────────────────────
-
     function commitZap(ZapParams calldata p) external whenNotPaused {
         if (p.amountIn == 0) revert ZeroAmount();
 
@@ -204,7 +212,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         if (p.slippageBps > config.maxSlippageBps) revert SlippageTooHigh();
         if (p.amountIn == 0) revert ZeroAmount();
 
-        // PAD-50: strict msg.value rules
         if (p.tokenIn == address(0)) {
             if (msg.value == 0) revert ZeroAmount();
             if (p.amountIn != msg.value) revert CommitmentAmountMismatch();
@@ -212,13 +219,14 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
             if (msg.value != 0) revert UnexpectedMsgValue();
         }
 
-        // PAD-52: all dust/refunds go back to the payer to avoid locking assets in recipient contracts
         address refundTo = msg.sender;
 
         IParagonRouter _router = router;
         IParagonFarm _farm = farm;
 
-        (address lpToken, uint256 allocPoint, , ) = _farm.poolInfo(p.pid);
+        (IERC20 lpTokenErc20, uint256 allocPoint, , , , , ) = _farm.poolInfo(p.pid);
+        address lpToken = address(lpTokenErc20);
+
         if (lpToken == address(0)) revert InvalidPair();
         if (allocPoint == 0) revert FarmNotActive();
 
@@ -320,10 +328,8 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
             IERC20(lpToken).safeTransfer(p.recipient, lpMinted);
         }
 
-        // PAD-52: return dust to payer (refundTo), not recipient
         _returnDust(token0, token1, refundTo);
 
-        // PAD-52: refund leftover WNATIVE (rounding) as native to payer (refundTo), revert on failure (no WNATIVE fallback)
         if (p.tokenIn == address(0)) {
             uint256 wBal = IERC20(WNATIVE).balanceOf(address(this));
             if (wBal > 0) {
@@ -346,16 +352,12 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         );
     }
 
-    // ────────────────────────────────────────────────
-    // PAD-52 helper: always send native, revert if fails (no WNATIVE fallback)
-    // ────────────────────────────────────────────────
     function _refundNativeOrRevert(address to, uint256 amount) internal {
         if (amount == 0) return;
         (bool success, ) = to.call{value: amount}("");
         if (!success) revert NativeRefundFailed();
     }
 
-    // PAD-52: dust returns go to refundTo (payer). If dust token is WNATIVE, unwrap and refund native.
     function _returnDust(address token0, address token1, address refundTo) internal {
         uint256 bal0 = IERC20(token0).balanceOf(address(this));
         uint256 bal1 = IERC20(token1).balanceOf(address(this));
@@ -382,10 +384,6 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
             }
         }
     }
-
-    // ────────────────────────────────────────────────
-    // The rest of the contract remains unchanged
-    // ────────────────────────────────────────────────
 
     function _paramsHash(ZapParams calldata p) internal pure returns (bytes32) {
         return keccak256(
@@ -672,7 +670,8 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
         uint256 n = farm.poolLength();
         for (uint256 pid = 0; pid < n; pid++) {
-            (address lpToken, , , ) = farm.poolInfo(pid);
+            (IERC20 lpTokenErc20, , , , , , ) = farm.poolInfo(pid);
+            address lpToken = address(lpTokenErc20);
             if (lpToken == address(0)) continue;
             if (token == lpToken) revert TokenNotRescuable();
             IParagonPair p = IParagonPair(lpToken);

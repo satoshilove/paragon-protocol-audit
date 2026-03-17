@@ -3,271 +3,419 @@ pragma solidity ^0.8.25;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
+/// @title VoterEscrow
+/// @notice Checkpointed ve-style escrow with historical reads.
+/// @dev This fixes the wrong-sign slopeChanges issue and supports real historical balance/supply reads.
 contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    struct Locked {
-        uint256 amount; // XPGN amount locked
-        uint256 end;    // unlock timestamp (rounded to week)
+    struct LockedBalance {
+        int128 amount;
+        uint256 end;
+    }
+
+    struct Point {
+        int128 bias;
+        int128 slope;
+        uint256 ts;
+        uint256 blk;
     }
 
     IERC20 public immutable XPGN;
 
     uint256 public constant WEEK = 7 days;
-    uint256 public constant MAXTIME = 4 * 365 days; // 4 years
+    uint256 public constant MAXTIME = 4 * 365 days;
 
-    // Global "point" state at checkpoint time `pointTs`
-    // totalSlope: sum(amount / MAXTIME) across all active locks
-    // totalBias:  sum( slope * (end - pointTs) ) at pointTs
-    int256 public totalSlope;
-    int256 public totalBias;
-    uint256 public pointTs;
+    // global epoch => point
+    uint256 public epoch;
+    mapping(uint256 => Point) public pointHistory;
 
-    // When a lock ends at time T (rounded to week), slope decreases by (amount/MAXTIME)
-    mapping(uint256 => int256) public slopeChanges; // weekTs => deltaSlope
+    // future week => delta slope
+    mapping(uint256 => int128) public slopeChanges;
 
-    mapping(address => Locked) public locked;
+    // user => current lock
+    mapping(address => LockedBalance) public locked;
 
-    event LockCreated(address indexed user, uint256 amount, uint256 end);
-    event LockAmountIncreased(address indexed user, uint256 amount);
-    event LockExtended(address indexed user, uint256 newEnd);
-    event Withdrawn(address indexed user, uint256 amount);
-    event Checkpoint(uint256 ts, int256 slope, int256 bias);
+    // user => latest user epoch
+    mapping(address => uint256) public userPointEpoch;
+    // user => epoch => point
+    mapping(address => mapping(uint256 => Point)) public userPointHistory;
+
+    event Deposit(
+        address indexed provider,
+        address indexed beneficiary,
+        uint256 value,
+        uint256 locktime,
+        uint8 depositType,
+        uint256 ts
+    );
+    event Withdraw(address indexed provider, uint256 value, uint256 ts);
+    event Supply(uint256 previousSupply, uint256 supply);
+    event Checkpoint(uint256 indexed globalEpoch, uint256 ts, int128 bias, int128 slope);
 
     constructor(address _token, address initialOwner) Ownable(initialOwner) {
         require(_token != address(0), "token=0");
         XPGN = IERC20(_token);
-        // Initialize at the current week start so historical reads for this week work.
-        pointTs = _roundDownWeek(block.timestamp);
+
+        pointHistory[0] = Point({
+            bias: 0,
+            slope: 0,
+            ts: block.timestamp,
+            blk: block.number
+        });
     }
 
-    // ---------------------------------------------------------------------
-    // Views
-    // ---------------------------------------------------------------------
-
-    function token() external view returns (address) { return address(XPGN); }
-
-    function balanceOf(address account) public view returns (uint256) {
-        Locked memory l = locked[account];
-        if (block.timestamp >= l.end) return 0;
-        uint256 dt = l.end - block.timestamp;
-        return (l.amount * dt) / MAXTIME;
+    function token() external view returns (address) {
+        return address(XPGN);
     }
 
-    /// @notice Historical (or future) ve-balance at an exact timestamp `ts`.
-    /// No clamping to block.timestamp — supports exact end-of-week snapshots.
-    function balanceOfAtTime(address account, uint256 ts) public view returns (uint256) {
-        Locked memory l = locked[account];
-        if (ts >= l.end) return 0;
-        uint256 dt = l.end - ts;
-        return (l.amount * dt) / MAXTIME;
+    function pause() external onlyOwner {
+        _pause();
     }
 
-    function totalSupply() public view returns (uint256) {
-        (int256 bias,,) = _supplyAt(block.timestamp, pointTs, totalBias, totalSlope);
-        return bias <= 0 ? 0 : uint256(bias);
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
-    /// @notice Historical (or future) total ve-supply at timestamp `ts`.
-    /// No clamping to block.timestamp — supports exact week snapshots.
-    function totalSupplyAtTime(uint256 ts) public view returns (uint256) {
-        (int256 bias,,) = _supplyAt(ts, pointTs, totalBias, totalSlope);
-        return bias <= 0 ? 0 : uint256(bias);
+    // ============================================================
+    // Lock creation
+    // ============================================================
+
+    function create_lock(uint256 amount, uint256 unlockTime)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        _createLockFor(msg.sender, amount, unlockTime);
     }
 
-    // ---------------------------------------------------------------------
-    // Core write ops
-    // ---------------------------------------------------------------------
+    function create_lock_for(
+        address to,
+        uint256 amount,
+        uint256 unlockTime
+    ) external whenNotPaused nonReentrant returns (uint256 tokenId) {
+        _createLockFor(to, amount, unlockTime);
+        return 0;
+    }
 
-    function create_lock(uint256 amount, uint256 unlockTime) external whenNotPaused nonReentrant {
+    function create_lock_for(
+        uint256 amount,
+        uint256 unlockTime,
+        address to
+    ) external whenNotPaused nonReentrant returns (uint256 tokenId) {
+        _createLockFor(to, amount, unlockTime);
+        return 0;
+    }
+
+    function _createLockFor(address beneficiary, uint256 amount, uint256 unlockTime) internal {
+        require(beneficiary != address(0), "beneficiary=0");
         require(amount > 0, "amount=0");
-        Locked memory l = locked[msg.sender];
-        require(l.amount == 0, "lock exists");
-        uint256 end = _roundedUnlock(unlockTime);
+
+        LockedBalance memory oldLocked = locked[beneficiary];
+        require(oldLocked.amount == 0, "lock exists");
+
+        uint256 end = _roundDownWeek(unlockTime);
         require(end > block.timestamp, "end<=now");
-        require(end <= block.timestamp + MAXTIME, "end>MAXTIME");
+        require(end <= block.timestamp + MAXTIME, "end>maxtime");
 
-        _checkpoint();
+        LockedBalance memory newLocked = LockedBalance({
+            amount: _toInt128(amount),
+            end: end
+        });
 
-        // Previous (none for new lock, branch kept for completeness)
-        int256 oldSlope = 0;
-        int256 oldBias  = 0;
-        if (l.amount > 0 && l.end > block.timestamp) {
-            oldSlope = int256(l.amount / MAXTIME);
-            oldBias  = int256((l.amount * (l.end - block.timestamp)) / MAXTIME);
-            slopeChanges[l.end] -= oldSlope;
-        }
+        uint256 supplyBefore = XPGN.balanceOf(address(this));
+        locked[beneficiary] = newLocked;
 
-        l.amount = amount;
-        l.end = end;
-        locked[msg.sender] = l;
-
-        int256 newSlope = int256(amount / MAXTIME);
-        int256 newBias  = int256((amount * (end - block.timestamp)) / MAXTIME);
-
-        totalSlope = totalSlope + newSlope - oldSlope;
-        totalBias  = totalBias + newBias - oldBias;
-
-        slopeChanges[end] += newSlope;
+        _checkpoint(beneficiary, oldLocked, newLocked);
 
         XPGN.safeTransferFrom(msg.sender, address(this), amount);
 
-        emit LockCreated(msg.sender, amount, end);
-        emit Checkpoint(block.timestamp, totalSlope, totalBias);
+        emit Deposit(msg.sender, beneficiary, amount, end, 0, block.timestamp);
+        emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
     }
 
     function increase_amount(uint256 amount) external whenNotPaused nonReentrant {
         require(amount > 0, "amount=0");
-        Locked memory l = locked[msg.sender];
-        require(l.amount > 0, "no lock");
-        require(l.end > block.timestamp, "expired");
 
-        _checkpoint();
+        LockedBalance memory oldLocked = locked[msg.sender];
+        require(oldLocked.amount > 0, "no lock");
+        require(oldLocked.end > block.timestamp, "expired");
 
-        int256 oldSlope = int256(l.amount / MAXTIME);
-        int256 oldBias  = int256((l.amount * (l.end - block.timestamp)) / MAXTIME);
-        slopeChanges[l.end] -= oldSlope;
+        LockedBalance memory newLocked = oldLocked;
+        newLocked.amount += _toInt128(amount);
 
-        l.amount += amount;
-        locked[msg.sender] = l;
+        uint256 supplyBefore = XPGN.balanceOf(address(this));
+        locked[msg.sender] = newLocked;
 
-        int256 newSlope = int256(l.amount / MAXTIME);
-        int256 newBias  = int256((l.amount * (l.end - block.timestamp)) / MAXTIME);
-
-        totalSlope = totalSlope + newSlope - oldSlope;
-        totalBias  = totalBias + newBias - oldBias;
-
-        slopeChanges[l.end] += newSlope;
+        _checkpoint(msg.sender, oldLocked, newLocked);
 
         XPGN.safeTransferFrom(msg.sender, address(this), amount);
 
-        emit LockAmountIncreased(msg.sender, amount);
-        emit Checkpoint(block.timestamp, totalSlope, totalBias);
+        emit Deposit(msg.sender, msg.sender, amount, newLocked.end, 1, block.timestamp);
+        emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
     }
 
     function increase_unlock_time(uint256 newUnlockTime) external whenNotPaused nonReentrant {
-        Locked memory l = locked[msg.sender];
-        require(l.amount > 0, "no lock");
-        require(l.end > block.timestamp, "expired");
+        LockedBalance memory oldLocked = locked[msg.sender];
+        require(oldLocked.amount > 0, "no lock");
+        require(oldLocked.end > block.timestamp, "expired");
 
-        uint256 newEnd = _roundedUnlock(newUnlockTime);
-        require(newEnd > l.end, "not extend");
-        require(newEnd <= block.timestamp + MAXTIME, "end>MAXTIME");
+        uint256 end = _roundDownWeek(newUnlockTime);
+        require(end > oldLocked.end, "not extended");
+        require(end <= block.timestamp + MAXTIME, "end>maxtime");
 
-        _checkpoint();
+        LockedBalance memory newLocked = oldLocked;
+        newLocked.end = end;
+        locked[msg.sender] = newLocked;
 
-        int256 oldSlope = int256(l.amount / MAXTIME);
-        int256 oldBias  = int256((l.amount * (l.end - block.timestamp)) / MAXTIME);
-        slopeChanges[l.end] -= oldSlope;
+        _checkpoint(msg.sender, oldLocked, newLocked);
 
-        l.end = newEnd;
-        locked[msg.sender] = l;
-
-        int256 newSlope = int256(l.amount / MAXTIME);
-        int256 newBias  = int256((l.amount * (newEnd - block.timestamp)) / MAXTIME);
-
-        totalSlope = totalSlope + newSlope - oldSlope;
-        totalBias  = totalBias + newBias - oldBias;
-
-        slopeChanges[newEnd] += newSlope;
-
-        emit LockExtended(msg.sender, newEnd);
-        emit Checkpoint(block.timestamp, totalSlope, totalBias);
+        emit Deposit(msg.sender, msg.sender, 0, end, 2, block.timestamp);
     }
 
     function withdraw() external nonReentrant {
-        Locked memory l = locked[msg.sender];
-        require(block.timestamp >= l.end, "not unlocked");
-        uint256 amt = l.amount;
-        require(amt > 0, "nothing");
+        LockedBalance memory oldLocked = locked[msg.sender];
+        require(oldLocked.amount > 0, "nothing");
+        require(block.timestamp >= oldLocked.end, "not unlocked");
 
-        _checkpoint();
+        LockedBalance memory newLocked = LockedBalance({amount: 0, end: 0});
+        locked[msg.sender] = newLocked;
 
-        int256 oldSlope = int256(amt / MAXTIME);
-        int256 oldBias  = int256((amt * (l.end > block.timestamp ? (l.end - block.timestamp) : 0)) / MAXTIME);
+        _checkpoint(msg.sender, oldLocked, newLocked);
 
-        totalSlope = totalSlope - oldSlope;
-        totalBias  = totalBias - oldBias;
+        uint256 value = uint256(uint128(oldLocked.amount));
+        XPGN.safeTransfer(msg.sender, value);
 
-        if (l.end > 0) {
-            slopeChanges[l.end] -= oldSlope;
+        emit Withdraw(msg.sender, value, block.timestamp);
+    }
+
+    function checkpoint() external {
+        LockedBalance memory empty;
+        _checkpoint(address(0), empty, empty);
+    }
+
+    // ============================================================
+    // Views
+    // ============================================================
+
+    function balanceOf(address addr) public view returns (uint256) {
+        uint256 uEpoch = userPointEpoch[addr];
+        if (uEpoch == 0) return 0;
+
+        Point memory pt = userPointHistory[addr][uEpoch];
+        if (block.timestamp < pt.ts) return 0;
+
+        int256 bias = int256(pt.bias) - int256(pt.slope) * int256(block.timestamp - pt.ts);
+        if (bias <= 0) return 0;
+        return uint256(bias);
+    }
+
+    function balanceOfAtTime(address addr, uint256 ts) public view returns (uint256) {
+        uint256 uEpoch = _findUserEpoch(addr, ts);
+        if (uEpoch == 0) return 0;
+
+        Point memory pt = userPointHistory[addr][uEpoch];
+        if (ts < pt.ts) return 0;
+
+        int256 bias = int256(pt.bias) - int256(pt.slope) * int256(ts - pt.ts);
+        if (bias <= 0) return 0;
+        return uint256(bias);
+    }
+
+    function totalSupply() public view returns (uint256) {
+        return totalSupplyAtTime(block.timestamp);
+    }
+
+    function totalSupplyAtTime(uint256 ts) public view returns (uint256) {
+        uint256 gEpoch = _findGlobalEpoch(ts);
+        Point memory pt = pointHistory[gEpoch];
+        return _supplyAt(pt, ts);
+    }
+
+    // ============================================================
+    // Internal checkpointing
+    // ============================================================
+
+    function _checkpoint(
+        address addr,
+        LockedBalance memory oldLocked,
+        LockedBalance memory newLocked
+    ) internal {
+        Point memory uOld;
+        Point memory uNew;
+        int128 oldDSlope;
+        int128 newDSlope;
+
+        if (addr != address(0)) {
+            if (oldLocked.end > block.timestamp && oldLocked.amount > 0) {
+                uOld.slope = oldLocked.amount / int128(int256(MAXTIME));
+                uOld.bias = uOld.slope * _toInt128(oldLocked.end - block.timestamp);
+            }
+            if (newLocked.end > block.timestamp && newLocked.amount > 0) {
+                uNew.slope = newLocked.amount / int128(int256(MAXTIME));
+                uNew.bias = uNew.slope * _toInt128(newLocked.end - block.timestamp);
+            }
+
+            oldDSlope = slopeChanges[oldLocked.end];
+            if (newLocked.end != 0) {
+                if (newLocked.end == oldLocked.end) {
+                    newDSlope = oldDSlope;
+                } else {
+                    newDSlope = slopeChanges[newLocked.end];
+                }
+            }
         }
 
-        delete locked[msg.sender];
+        uint256 _epoch = epoch;
+        Point memory lastPoint = pointHistory[_epoch];
+        uint256 lastCheckpointTs = lastPoint.ts;
 
-        XPGN.safeTransfer(msg.sender, amt);
-        emit Withdrawn(msg.sender, amt);
-        emit Checkpoint(block.timestamp, totalSlope, totalBias);
+        if (block.timestamp > lastPoint.ts) {
+            uint256 ti = _roundDownWeek(lastCheckpointTs);
+
+            for (uint256 i = 0; i < 255; ++i) {
+                ti += WEEK;
+                int128 dSlope = 0;
+
+                if (ti > block.timestamp) {
+                    ti = block.timestamp;
+                } else {
+                    dSlope = slopeChanges[ti];
+                }
+
+                int256 newBias = int256(lastPoint.bias) - int256(lastPoint.slope) * int256(ti - lastCheckpointTs);
+                if (newBias < 0) newBias = 0;
+
+                int256 newSlope = int256(lastPoint.slope) + int256(dSlope);
+                if (newSlope < 0) newSlope = 0;
+
+                lastPoint.bias = int128(newBias);
+                lastPoint.slope = int128(newSlope);
+                lastCheckpointTs = ti;
+                lastPoint.ts = ti;
+                lastPoint.blk = block.number;
+
+                _epoch += 1;
+                pointHistory[_epoch] = lastPoint;
+
+                if (ti == block.timestamp) {
+                    break;
+                }
+            }
+        }
+
+        epoch = _epoch;
+
+        if (addr != address(0)) {
+            int256 bias_ = int256(lastPoint.bias) + int256(uNew.bias) - int256(uOld.bias);
+            int256 slope_ = int256(lastPoint.slope) + int256(uNew.slope) - int256(uOld.slope);
+
+            if (bias_ < 0) bias_ = 0;
+            if (slope_ < 0) slope_ = 0;
+
+            lastPoint.bias = int128(bias_);
+            lastPoint.slope = int128(slope_);
+            pointHistory[_epoch] = lastPoint;
+
+            // old end: cancel its scheduled negative drop, then re-apply based on new state
+            if (oldLocked.end > block.timestamp) {
+                oldDSlope += uOld.slope;
+                if (newLocked.end == oldLocked.end) {
+                    oldDSlope -= uNew.slope;
+                }
+                slopeChanges[oldLocked.end] = oldDSlope;
+            }
+
+            // new end: schedule negative slope at expiry
+            if (newLocked.end > block.timestamp && newLocked.end > oldLocked.end) {
+                newDSlope -= uNew.slope;
+                slopeChanges[newLocked.end] = newDSlope;
+            }
+
+            uint256 userEpoch = userPointEpoch[addr] + 1;
+            userPointEpoch[addr] = userEpoch;
+
+            uNew.ts = block.timestamp;
+            uNew.blk = block.number;
+            userPointHistory[addr][userEpoch] = uNew;
+        }
+
+        emit Checkpoint(_epoch, block.timestamp, pointHistory[_epoch].bias, pointHistory[_epoch].slope);
     }
 
-    // ---------------------------------------------------------------------
-    // Helpers / admin
-    // ---------------------------------------------------------------------
+    function _supplyAt(Point memory point, uint256 t) internal view returns (uint256) {
+        Point memory lastPoint = point;
+        uint256 ti = _roundDownWeek(lastPoint.ts);
 
-    /// @notice Expose checkpoint so external callers (or tests) can force an update.
-    function checkpoint() external {
-        _checkpoint();
-    }
+        for (uint256 i = 0; i < 255; ++i) {
+            ti += WEEK;
+            int128 dSlope = 0;
 
-    function pause() external onlyOwner { _pause(); }
-    function unpause() external onlyOwner { _unpause(); }
+            if (ti > t) {
+                ti = t;
+            } else {
+                dSlope = slopeChanges[ti];
+            }
 
-    // ---------------------------------------------------------------------
-    // Internals
-    // ---------------------------------------------------------------------
-
-    function _checkpoint() internal {
-        (int256 newBias, int256 newSlope, uint256 newTs) =
-            _supplyAt(block.timestamp, pointTs, totalBias, totalSlope);
-
-        totalBias = newBias;
-        totalSlope = newSlope;
-        pointTs = newTs;
-    }
-
-    /// @dev Evolves (bias, slope) from `fromTs` to exact `targetTs`, week by week,
-    ///      applying linear decay and scheduled slope changes at week boundaries.
-    function _supplyAt(
-        uint256 targetTs,
-        uint256 fromTs,
-        int256 bias,
-        int256 slope
-    ) internal view returns (int256, int256, uint256) {
-        // If asked for a time before the last checkpoint, clamp to the checkpoint;
-        // we don't support reconstructing state older than pointTs without a full history.
-        if (targetTs < fromTs) targetTs = fromTs;
-
-        uint256 ts = fromTs;
-
-        while (ts < targetTs) {
-            uint256 next = _roundDownWeek(ts + WEEK);
-            if (next > targetTs) next = targetTs;
-
-            uint256 dt = next - ts;
-            // linear decay over dt
-            bias -= slope * int256(dt);
+            int256 bias = int256(lastPoint.bias) - int256(lastPoint.slope) * int256(ti - lastPoint.ts);
             if (bias < 0) bias = 0;
 
-            // apply scheduled slope change at the boundary
-            int256 dSlope = slopeChanges[next];
-            slope += dSlope;
-            if (slope < 0) slope = 0;
+            lastPoint.bias = int128(bias);
+            if (ti == t) break;
 
-            ts = next;
+            int256 slope_ = int256(lastPoint.slope) + int256(dSlope);
+            if (slope_ < 0) slope_ = 0;
+
+            lastPoint.slope = int128(slope_);
+            lastPoint.ts = ti;
         }
-        return (bias, slope, ts);
+
+        if (lastPoint.bias < 0) return 0;
+        return uint256(uint128(lastPoint.bias));
+    }
+
+    function _findUserEpoch(address addr, uint256 ts) internal view returns (uint256) {
+        uint256 min = 0;
+        uint256 max = userPointEpoch[addr];
+
+        for (uint256 i = 0; i < 128; ++i) {
+            if (min >= max) break;
+            uint256 mid = (min + max + 1) / 2;
+            if (userPointHistory[addr][mid].ts <= ts) {
+                min = mid;
+            } else {
+                max = mid - 1;
+            }
+        }
+        return min;
+    }
+
+    function _findGlobalEpoch(uint256 ts) internal view returns (uint256) {
+        uint256 min = 0;
+        uint256 max = epoch;
+
+        for (uint256 i = 0; i < 128; ++i) {
+            if (min >= max) break;
+            uint256 mid = (min + max + 1) / 2;
+            if (pointHistory[mid].ts <= ts) {
+                min = mid;
+            } else {
+                max = mid - 1;
+            }
+        }
+        return min;
     }
 
     function _roundDownWeek(uint256 t) internal pure returns (uint256) {
         return (t / WEEK) * WEEK;
     }
 
-    function _roundedUnlock(uint256 t) internal pure returns (uint256) {
-        // round up to whole weeks for anti-grief & consistency
-        return ((t + WEEK - 1) / WEEK) * WEEK;
+    function _toInt128(uint256 x) internal pure returns (int128) {
+        require(x <= uint256(uint128(type(int128).max)), "int128 overflow");
+        return int128(uint128(x));
     }
 }
