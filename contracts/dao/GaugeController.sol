@@ -13,12 +13,16 @@ interface IUsageMultiplier {
     function applyDecay(address user) external;
 }
 
+/// @title GaugeController
+/// @notice veXPGN voting controller with live voting during epoch and finalized snapshots for emission distribution
+/// @dev Production-hardened: finalized previous-epoch weights prevent vote sniping on distribution
 contract GaugeController is Ownable, Pausable {
     IVoterEscrowVotes public immutable ve;
     IUsageMultiplier public immutable usage;
 
     uint256 public constant WEEK = 7 days;
     uint256 public constant MAX_BPS = 10_000;
+    uint256 public constant MAX_GAUGES = 500;
 
     uint256 public minVeToVote = 250e18;
     uint256 public maxGaugesPerVote = 10;
@@ -27,8 +31,14 @@ contract GaugeController is Ownable, Pausable {
     address[] public gauges;
     mapping(address => bool) public isGauge;
 
+    // live weights (modifiable during current epoch)
     mapping(uint256 => mapping(address => uint256)) public gaugeWeight;
     mapping(uint256 => uint256) public totalWeight;
+
+    // finalized snapshot (immutable after epoch close)
+    mapping(uint256 => bool) public epochFinalized;
+    mapping(uint256 => mapping(address => uint256)) public finalizedGaugeWeight;
+    mapping(uint256 => uint256) public finalizedTotalWeight;
 
     mapping(uint256 => mapping(address => mapping(address => uint256))) public userVoteBps;
     mapping(uint256 => mapping(address => uint256)) public userUsedBps;
@@ -40,7 +50,8 @@ contract GaugeController is Ownable, Pausable {
     event GaugeRemoved(address indexed gauge);
     event Voted(address indexed user, uint256 indexed epoch, uint256 userPowerCached, address[] gauges, uint256[] bps);
     event Reset(address indexed user, uint256 indexed epoch, uint256 userPowerCleared);
-    event ParamsSet(uint256 minVeToVote, uint256 maxGaugesPerVote, uint256 voteCooldown);
+    event ParamsUpdated(uint256 minVeToVote, uint256 maxGaugesPerVote, uint256 voteCooldown);
+    event EpochFinalized(uint256 indexed ep, uint256 totalWeightFinalized);
 
     constructor(address _ve, address _usage, address initialOwner) Ownable(initialOwner) {
         require(_ve != address(0), "ve=0");
@@ -57,26 +68,27 @@ contract GaugeController is Ownable, Pausable {
         external
         onlyOwner
     {
-        require(_maxGaugesPerVote >= 1 && _maxGaugesPerVote <= 20, "bad max");
-        require(_minVeToVote <= 10_000_000e18, "min too high");
+        require(_maxGaugesPerVote >= 1 && _maxGaugesPerVote <= 20, "maxGaugesPerVote out of range");
+        require(_minVeToVote <= 10_000_000e18, "minVeToVote too high");
 
         minVeToVote = _minVeToVote;
         maxGaugesPerVote = _maxGaugesPerVote;
         voteCooldown = _voteCooldown;
 
-        emit ParamsSet(_minVeToVote, _maxGaugesPerVote, _voteCooldown);
+        emit ParamsUpdated(_minVeToVote, _maxGaugesPerVote, _voteCooldown);
     }
 
     function addGauge(address gauge) external onlyOwner {
-        require(gauge != address(0), "0");
-        require(!isGauge[gauge], "exists");
+        require(gauge != address(0), "gauge=0");
+        require(!isGauge[gauge], "gauge already exists");
+        require(gauges.length < MAX_GAUGES, "max gauges reached");
         isGauge[gauge] = true;
         gauges.push(gauge);
         emit GaugeAdded(gauge);
     }
 
     function removeGauge(address gauge) external onlyOwner {
-        require(isGauge[gauge], "none");
+        require(isGauge[gauge], "gauge does not exist");
         isGauge[gauge] = false;
 
         uint256 L = gauges.length;
@@ -120,24 +132,25 @@ contract GaugeController is Ownable, Pausable {
     }
 
     function vote(address[] calldata _gauges, uint256[] calldata _bps) external whenNotPaused {
-        require(_gauges.length == _bps.length, "len");
-        require(_gauges.length > 0, "empty");
-        require(_gauges.length <= maxGaugesPerVote, "too many");
+        require(_gauges.length == _bps.length, "arrays length mismatch");
+        require(_gauges.length > 0, "empty vote");
+        require(_gauges.length <= maxGaugesPerVote, "too many gauges");
 
         uint256 ep = epoch();
+        require(!epochFinalized[ep], "current epoch already finalized");
 
         if (voteCooldown > 0) {
-            require(block.timestamp >= userLastVoteTs[ep][msg.sender] + voteCooldown, "cooldown");
+            require(block.timestamp >= userLastVoteTs[ep][msg.sender] + voteCooldown, "vote cooldown active");
         }
 
         usage.applyDecay(msg.sender);
 
         uint256 p = userPower(msg.sender);
-        require(p > 0, "no power");
+        require(p > 0, "no voting power");
 
         for (uint256 i = 0; i < _gauges.length; ++i) {
             for (uint256 j = 0; j < i; ++j) {
-                require(_gauges[i] != _gauges[j], "dup gauge");
+                require(_gauges[i] != _gauges[j], "duplicate gauge");
             }
         }
 
@@ -149,11 +162,11 @@ contract GaugeController is Ownable, Pausable {
             address g = _gauges[i];
             uint256 b = _bps[i];
 
-            require(isGauge[g], "not gauge");
-            require(b <= MAX_BPS, "bps");
+            require(isGauge[g], "not a registered gauge");
+            require(b <= MAX_BPS, "bps exceeds 100%");
 
             used += b;
-            require(used <= MAX_BPS, "sum>100%");
+            require(used <= MAX_BPS, "total bps exceeds 100%");
 
             userVoteBps[ep][msg.sender][g] = b;
             userVotedGauges[ep][msg.sender].push(g);
@@ -167,6 +180,39 @@ contract GaugeController is Ownable, Pausable {
         userLastVoteTs[ep][msg.sender] = block.timestamp;
 
         emit Voted(msg.sender, ep, p, _gauges, _bps);
+    }
+
+    function finalizeEpoch(uint256 ep) external whenNotPaused {
+        _finalizeEpoch(ep);
+    }
+
+    function batchFinalize(uint256[] calldata eps) external whenNotPaused {
+        for (uint256 i = 0; i < eps.length; ++i) {
+            if (!epochFinalized[eps[i]]) {
+                _finalizeEpoch(eps[i]);
+            }
+        }
+    }
+
+    function _finalizeEpoch(uint256 ep) internal {
+        require(ep < epoch(), "epoch not yet closed");
+        require(!epochFinalized[ep], "epoch already finalized");
+
+        uint256 tw = totalWeight[ep];
+        require(tw > 0, "no total weight");
+
+        finalizedTotalWeight[ep] = tw;
+
+        uint256 n = gauges.length;
+        for (uint256 i = 0; i < n; ++i) {
+            address g = gauges[i];
+            if (isGauge[g]) {
+                finalizedGaugeWeight[ep][g] = gaugeWeight[ep][g];
+            }
+        }
+
+        epochFinalized[ep] = true;
+        emit EpochFinalized(ep, tw);
     }
 
     function gaugeWeightAt(uint256 ep, address gauge) external view returns (uint256) {
@@ -185,9 +231,16 @@ contract GaugeController is Ownable, Pausable {
         return totalWeight[epoch()];
     }
 
+    function gaugeWeightFinal(uint256 ep, address gauge) external view returns (uint256) {
+        return finalizedGaugeWeight[ep][gauge];
+    }
+
+    function totalWeightFinal(uint256 ep) external view returns (uint256) {
+        return finalizedTotalWeight[ep];
+    }
+
     function _resetFor(uint256 ep, address user) internal {
         address[] storage voted = userVotedGauges[ep][user];
-
         if (voted.length == 0) {
             userUsedBps[ep][user] = 0;
             powerUsedAtVote[ep][user] = 0;
@@ -195,9 +248,7 @@ contract GaugeController is Ownable, Pausable {
         }
 
         uint256 p = powerUsedAtVote[ep][user];
-        if (p == 0) {
-            p = userPower(user);
-        }
+        if (p == 0) p = userPower(user);
 
         for (uint256 i = 0; i < voted.length; ++i) {
             address g = voted[i];
@@ -205,13 +256,8 @@ contract GaugeController is Ownable, Pausable {
             if (b == 0) continue;
 
             uint256 delta = (p * b) / MAX_BPS;
-
-            uint256 gw = gaugeWeight[ep][g];
-            gaugeWeight[ep][g] = gw > delta ? gw - delta : 0;
-
-            uint256 tw = totalWeight[ep];
-            totalWeight[ep] = tw > delta ? tw - delta : 0;
-
+            gaugeWeight[ep][g] = gaugeWeight[ep][g] > delta ? gaugeWeight[ep][g] - delta : 0;
+            totalWeight[ep] = totalWeight[ep] > delta ? totalWeight[ep] - delta : 0;
             userVoteBps[ep][user][g] = 0;
         }
 

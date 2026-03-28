@@ -9,7 +9,11 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /// @title VoterEscrow
 /// @notice Checkpointed ve-style escrow with historical reads.
-/// @dev This fixes the wrong-sign slopeChanges issue and supports real historical balance/supply reads.
+/// @dev Production-hardened:
+/// - correct negative slope scheduling
+/// - historical balance/supply reads
+/// - longer checkpoint catch-up bound (520 weeks)
+/// - minimum lock duration enforced at 4 weeks
 contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -28,7 +32,9 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     IERC20 public immutable XPGN;
 
     uint256 public constant WEEK = 7 days;
+    uint256 public constant MIN_LOCK_TIME = 4 weeks;
     uint256 public constant MAXTIME = 4 * 365 days;
+    uint256 internal constant MAX_WEEKS_FORWARD = 520; // ~10 years
 
     // global epoch => point
     uint256 public epoch;
@@ -42,6 +48,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
 
     // user => latest user epoch
     mapping(address => uint256) public userPointEpoch;
+
     // user => epoch => point
     mapping(address => mapping(uint256 => Point)) public userPointHistory;
 
@@ -82,7 +89,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     }
 
     // ============================================================
-    // Lock creation
+    // Lock creation / management
     // ============================================================
 
     function create_lock(uint256 amount, uint256 unlockTime)
@@ -119,7 +126,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
         require(oldLocked.amount == 0, "lock exists");
 
         uint256 end = _roundDownWeek(unlockTime);
-        require(end > block.timestamp, "end<=now");
+        require(end >= block.timestamp + MIN_LOCK_TIME, "min 4 weeks");
         require(end <= block.timestamp + MAXTIME, "end>maxtime");
 
         LockedBalance memory newLocked = LockedBalance({
@@ -166,6 +173,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
 
         uint256 end = _roundDownWeek(newUnlockTime);
         require(end > oldLocked.end, "not extended");
+        require(end >= block.timestamp + MIN_LOCK_TIME, "min 4 weeks");
         require(end <= block.timestamp + MAXTIME, "end>maxtime");
 
         LockedBalance memory newLocked = oldLocked;
@@ -277,7 +285,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
         if (block.timestamp > lastPoint.ts) {
             uint256 ti = _roundDownWeek(lastCheckpointTs);
 
-            for (uint256 i = 0; i < 255; ++i) {
+            for (uint256 i = 0; i < MAX_WEEKS_FORWARD; ++i) {
                 ti += WEEK;
                 int128 dSlope = 0;
 
@@ -321,7 +329,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
             lastPoint.slope = int128(slope_);
             pointHistory[_epoch] = lastPoint;
 
-            // old end: cancel its scheduled negative drop, then re-apply based on new state
+            // old end: cancel previously scheduled negative slope, then re-apply based on new state
             if (oldLocked.end > block.timestamp) {
                 oldDSlope += uOld.slope;
                 if (newLocked.end == oldLocked.end) {
@@ -336,12 +344,12 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
                 slopeChanges[newLocked.end] = newDSlope;
             }
 
-            uint256 userEpoch = userPointEpoch[addr] + 1;
-            userPointEpoch[addr] = userEpoch;
+            uint256 userEpoch_ = userPointEpoch[addr] + 1;
+            userPointEpoch[addr] = userEpoch_;
 
             uNew.ts = block.timestamp;
             uNew.blk = block.number;
-            userPointHistory[addr][userEpoch] = uNew;
+            userPointHistory[addr][userEpoch_] = uNew;
         }
 
         emit Checkpoint(_epoch, block.timestamp, pointHistory[_epoch].bias, pointHistory[_epoch].slope);
@@ -351,7 +359,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
         Point memory lastPoint = point;
         uint256 ti = _roundDownWeek(lastPoint.ts);
 
-        for (uint256 i = 0; i < 255; ++i) {
+        for (uint256 i = 0; i < MAX_WEEKS_FORWARD; ++i) {
             ti += WEEK;
             int128 dSlope = 0;
 

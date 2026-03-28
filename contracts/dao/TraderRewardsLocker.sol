@@ -14,6 +14,8 @@ interface IUsagePointsLockerView {
     function currentEpoch() external view returns (uint256);
 }
 
+/// @title TraderRewardsLocker
+/// @notice Converts trader rewards into auto-locked veXPGN after epoch finalization.
 contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -45,7 +47,7 @@ contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
         uint256 tokenId
     );
     event LockConfig(uint256 minWeeks, uint256 maxWeeks, uint16 gasKickbackBips);
-    event EmergencyWithdraw(address token, address to, uint256 amount);
+    event EmergencyWithdraw(address indexed token, address indexed to, uint256 amount);
 
     constructor(
         address _owner,
@@ -86,7 +88,6 @@ contract TraderRewardsLocker is Ownable, Pausable, ReentrancyGuard {
     }
 
     /// @notice Finalize only after epoch closes.
-    /// @dev Fixes early-claim / undercount exploit class flagged by audit.
     function finalizeEpoch(uint256 epoch) public whenNotPaused {
         require(epoch < usage.currentEpoch(), "epoch not closed");
         require(!epochFinalized[epoch], "already finalized");

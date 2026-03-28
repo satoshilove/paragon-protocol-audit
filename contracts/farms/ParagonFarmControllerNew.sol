@@ -16,20 +16,15 @@ interface IReferralManager {
 interface IRewardDripper {
     function drip() external returns (uint256 sent);
     function pendingAccrued() external view returns (uint256);
-    // PAD-23
     function rewardToken() external view returns (address);
-    // PAD-36 hardening (optional but recommended)
     function minDripAmount() external view returns (uint256);
     function dripCooldownSecs() external view returns (uint64);
     function lastDripAt() external view returns (uint64);
 }
 
-/**
- * @title ParagonFarmController - Final Production Release (November 2025) - Audit fixes applied
- * @notice High-performance MasterChef-style farm with full safety when rewardToken is used as LP token
- * @dev Design choice: LP tokens must be standard ERC20 (no fee-on-transfer / rebasing). This matches Pancake/Sushi
- *      MasterChef assumptions and avoids accounting ambiguity (PAD-07).
- */
+/// @title ParagonFarmController
+/// @notice MasterChef-style farm with veXPGN gauge integration
+/// @dev Core logic unchanged; only minimal controlled notifyGaugeReward hook added
 contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -39,20 +34,20 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
     uint256 public constant PRECISION_FACTOR = 1e30;
 
     struct UserInfo {
-        uint256 amount;          // LP tokens staked
-        uint256 rewardDebt;      // Reward debt for accounting
-        uint256 lastDepositTime; // For harvest delay
-        uint256 unpaid;          // Accrued but not yet claimable rewards
+        uint256 amount;
+        uint256 rewardDebt;
+        uint256 lastDepositTime;
+        uint256 unpaid;
     }
 
     struct PoolInfo {
-        IERC20 lpToken;            // LP token
-        uint256 allocPoint;        // Allocation points
-        uint256 lastRewardBlock;   // Last block rewards were updated
-        uint256 accRewardPerShare; // × PRECISION_FACTOR
-        uint256 harvestDelay;      // Seconds before rewards are claimable
-        uint256 totalStaked;       // Total LP staked
-        uint256 rewardTokenStaked; // Only used if lpToken == rewardToken
+        IERC20 lpToken;
+        uint256 allocPoint;
+        uint256 lastRewardBlock;
+        uint256 accRewardPerShare;
+        uint256 harvestDelay;
+        uint256 totalStaked;
+        uint256 rewardTokenStaked;
     }
 
     IERC20 public immutable rewardToken;
@@ -68,11 +63,11 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
 
     IRewardDripper public dripper;
     uint256 public lowWaterDays = 3;
-    uint64 public dripCooldownSecs = 900; // 15 min
+    uint64 public dripCooldownSecs = 900;
     uint64 public lastDripAt;
     uint256 public minDripAmount;
 
-    uint16 public constant MAX_PERF_FEE_BIPS = 500; // 5.00%
+    uint16 public constant MAX_PERF_FEE_BIPS = 500;
     address public feeRecipient;
     uint16 public performanceFeeBips;
 
@@ -81,7 +76,10 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
 
     uint256 private totalRewardTokenStakedAsLP;
 
-    // Events
+    // veXPGN integration
+    address public gaugeDistributor;
+    mapping(uint256 => uint256) public pendingGaugeRewards;
+
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event Harvest(address indexed user, uint256 indexed pid, uint256 netAmount);
@@ -96,11 +94,11 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
     event DripperPoked(uint256 sent, uint256 availableAfter);
     event DripperConfigUpdated(address dripper, uint256 lowWaterDays, uint64 cooldown, uint256 minDrip);
     event AutoYieldCallerUpdated(address indexed caller, bool allowed);
-
-    // ────────────────────────────── Ownership + Admin Role Sync (PAD-51 FIX) ──────────────────────────────
     event OwnershipAndAdminTransferred(address indexed previousOwner, address indexed newOwner);
-    // Per-admin revoke visibility (monitoring/audit trail)
     event ExtraAdminRevoked(address indexed revokedAdmin);
+    event GaugeDistributorUpdated(address indexed distributor);
+    event GaugeRewardAdded(uint256 indexed pid, uint256 amount);
+    event GaugeRewardQueued(uint256 indexed pid, uint256 amount);
 
     constructor(
         address initialOwner,
@@ -108,15 +106,14 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         uint256 _rewardPerBlock,
         uint256 _startBlock
     ) Ownable(initialOwner) {
-        require(initialOwner != address(0), "zero owner");
-        require(address(_rewardToken) != address(0), "zero reward token");
+        require(initialOwner != address(0), "owner=0");
+        require(address(_rewardToken) != address(0), "rewardToken=0");
 
         rewardToken = _rewardToken;
         rewardPerBlock = _rewardPerBlock;
         startBlock = _startBlock;
         feeRecipient = initialOwner;
 
-        // PAD-20: Dynamic minDripAmount ≈ 1000 full tokens
         try IERC20Metadata(address(_rewardToken)).decimals() returns (uint8 dec) {
             minDripAmount = 1000 * (10 ** uint256(dec));
         } catch {
@@ -126,54 +123,36 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
     }
 
-    // ────────────────────────────── Ownership Override (PAD-51) ──────────────────────────────
-
-    /**
-     * @dev Enforce strict coupling: after any ownership transfer, only the new owner holds DEFAULT_ADMIN_ROLE.
-     *      This prevents privilege fragmentation even if extra admins were previously granted manually.
-     */
     function transferOwnership(address newOwner) public virtual override onlyOwner {
-        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        require(newOwner != address(0), "newOwner=0");
         address oldOwner = owner();
-
-        // Perform the standard ownership transfer
         super.transferOwnership(newOwner);
 
-        // Grant DEFAULT_ADMIN_ROLE to newOwner if not already held
         if (!hasRole(DEFAULT_ADMIN_ROLE, newOwner)) {
             _grantRole(DEFAULT_ADMIN_ROLE, newOwner);
         }
 
-        // Revoke DEFAULT_ADMIN_ROLE from all other holders (safe snapshot pattern)
         uint256 count = getRoleMemberCount(DEFAULT_ADMIN_ROLE);
         address[] memory revokeList = new address[](count);
 
-        // Snapshot current members (excluding newOwner)
         for (uint256 i = 0; i < count; i++) {
             address member = getRoleMember(DEFAULT_ADMIN_ROLE, i);
-            if (member != newOwner) {
-                revokeList[i] = member;
-            }
+            if (member != newOwner) revokeList[i] = member;
         }
 
-        // Revoke from snapshot
         for (uint256 i = 0; i < count; i++) {
-            address member = revokeList[i];
-            if (member != address(0) && member != newOwner) { // extra safety
-                _revokeRole(DEFAULT_ADMIN_ROLE, member);
-                emit ExtraAdminRevoked(member);
+            if (revokeList[i] != address(0) && revokeList[i] != newOwner) {
+                _revokeRole(DEFAULT_ADMIN_ROLE, revokeList[i]);
+                emit ExtraAdminRevoked(revokeList[i]);
             }
         }
 
         emit OwnershipAndAdminTransferred(oldOwner, newOwner);
     }
 
-    // Prevent accidental renounce (recommended for governance contracts)
     function renounceOwnership() public virtual override onlyOwner {
-        revert("Renounce ownership disabled for safety");
+        revert("renounce disabled for safety");
     }
-
-    // ────────────────────────────── Guardian / Pause ──────────────────────────────
 
     function pause() external onlyRole(GUARDIAN_ROLE) {
         _pause();
@@ -183,20 +162,15 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         _unpause();
     }
 
-    // ────────────────────────────── Admin Functions ──────────────────────────────
-
     function setReferralManager(address _ref) external onlyOwner {
-        require(_ref != address(0), "zero ref");
+        require(_ref != address(0), "ref=0");
         referralManager = IReferralManager(_ref);
     }
 
     function setAutoYieldCaller(address caller, bool allowed) external onlyOwner {
-        require(caller != address(0), "zero caller");
-        if (allowed) {
-            _grantRole(AUTOYIELD_CALLER_ROLE, caller);
-        } else {
-            _revokeRole(AUTOYIELD_CALLER_ROLE, caller);
-        }
+        require(caller != address(0), "caller=0");
+        if (allowed) _grantRole(AUTOYIELD_CALLER_ROLE, caller);
+        else _revokeRole(AUTOYIELD_CALLER_ROLE, caller);
         emit AutoYieldCallerUpdated(caller, allowed);
     }
 
@@ -208,38 +182,25 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
 
     function setEmissionsPaused(bool _paused) external onlyOwner {
         if (_paused == emissionsPaused) return;
-
-        if (_paused) {
-            massUpdateAllPools();
-            emissionsPaused = true;
-            emit EmissionsPaused(true);
-            return;
-        }
-
         massUpdateAllPools();
-        emissionsPaused = false;
-        emit EmissionsPaused(false);
+        emissionsPaused = _paused;
+        emit EmissionsPaused(_paused);
     }
 
     function setPerformanceFee(address _recipient, uint16 _bips) external onlyOwner {
-        require(_recipient != address(0), "zero recipient");
+        require(_recipient != address(0), "recipient=0");
         require(_bips <= MAX_PERF_FEE_BIPS, "fee too high");
         feeRecipient = _recipient;
         performanceFeeBips = _bips;
         emit PerformanceFeeUpdated(_recipient, _bips);
     }
 
-    function setDripperConfig(
-        address _dripper,
-        uint256 _days,
-        uint64 _cooldown,
-        uint256 _min
-    ) external onlyOwner {
-        require(_min > 0, "min=0");
+    function setDripperConfig(address _dripper, uint256 _days, uint64 _cooldown, uint256 _min) external onlyOwner {
+        require(_min > 0, "minDrip=0");
 
         if (_dripper != address(0)) {
             IRewardDripper newDripper = IRewardDripper(_dripper);
-            require(newDripper.rewardToken() == address(rewardToken), "reward token mismatch");
+            require(newDripper.rewardToken() == address(rewardToken), "token mismatch");
             dripper = newDripper;
         } else {
             dripper = IRewardDripper(address(0));
@@ -252,11 +213,15 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         emit DripperConfigUpdated(_dripper, _days, _cooldown, _min);
     }
 
-    // ────────────────────────────── Pool Management ──────────────────────────────
+    function setGaugeDistributor(address _dist) external onlyOwner {
+        require(_dist != address(0), "dist=0");
+        gaugeDistributor = _dist;
+        emit GaugeDistributorUpdated(_dist);
+    }
 
     function addPool(uint256 _allocPoint, IERC20 _lpToken, uint256 _harvestDelay) external onlyOwner {
-        require(address(_lpToken) != address(0), "zero lpToken");
-        require(poolInfo.length < 300, "Maximum number of pools reached");
+        require(address(_lpToken) != address(0), "lpToken=0");
+        require(poolInfo.length < 300, "max pools reached");
 
         massUpdateAllPools();
         totalAllocPoint += _allocPoint;
@@ -285,8 +250,6 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         emit PoolUpdated(_pid, _allocPoint, _harvestDelay);
     }
 
-    // ────────────────────────────── Dripper Automation ──────────────────────────────
-
     function _maybeTopUpFromDripper() internal {
         if (address(dripper) == address(0) || emissionsPaused || rewardPerBlock == 0) return;
         if (block.timestamp < lastDripAt + dripCooldownSecs) return;
@@ -310,8 +273,6 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         _maybeTopUpFromDripper();
     }
 
-    // ────────────────────────────── Core Functions ──────────────────────────────
-
     function massUpdateAllPools() public {
         uint256 len = poolInfo.length;
         for (uint256 i = 0; i < len; ++i) {
@@ -322,21 +283,50 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
     function updatePool(uint256 _pid) public {
         _maybeTopUpFromDripper();
         PoolInfo storage pool = poolInfo[_pid];
-        if (block.number <= pool.lastRewardBlock) return;
 
-        uint256 lpSupply = pool.totalStaked;
-        if (lpSupply == 0 || emissionsPaused || totalAllocPoint == 0) {
+        uint256 queued = pendingGaugeRewards[_pid];
+
+        if (block.number > pool.lastRewardBlock) {
+            uint256 lpSupply = pool.totalStaked;
+
+            if (lpSupply > 0 && totalAllocPoint > 0 && !emissionsPaused) {
+                if (queued > 0) {
+                    pendingGaugeRewards[_pid] = 0;
+                    pool.accRewardPerShare += (queued * PRECISION_FACTOR) / lpSupply;
+                }
+
+                uint256 blocks = block.number - pool.lastRewardBlock;
+                uint256 reward = (blocks * rewardPerBlock * pool.allocPoint) / totalAllocPoint;
+                if (reward > 0) {
+                    pool.accRewardPerShare += (reward * PRECISION_FACTOR) / lpSupply;
+                }
+            }
+
             pool.lastRewardBlock = block.number;
-            return;
+        } else if (queued > 0 && pool.totalStaked > 0) {
+            pendingGaugeRewards[_pid] = 0;
+            pool.accRewardPerShare += (queued * PRECISION_FACTOR) / pool.totalStaked;
+            pool.lastRewardBlock = block.number;
         }
+    }
 
-        uint256 blocks = block.number - pool.lastRewardBlock;
-        uint256 reward = (blocks * rewardPerBlock * pool.allocPoint) / totalAllocPoint;
-        if (reward > 0) {
-            pool.accRewardPerShare += (reward * PRECISION_FACTOR) / lpSupply;
+    function notifyGaugeReward(uint256 _pid, uint256 _amount) external whenNotPaused nonReentrant {
+        require(gaugeDistributor != address(0), "distributor not set");
+        require(msg.sender == gaugeDistributor, "only distributor");
+        require(_amount > 0, "amount=0");
+
+        rewardToken.safeTransferFrom(msg.sender, address(this), _amount);
+
+        PoolInfo storage pool = poolInfo[_pid];
+        updatePool(_pid);
+
+        if (pool.totalStaked > 0) {
+            pool.accRewardPerShare += (_amount * PRECISION_FACTOR) / pool.totalStaked;
+            emit GaugeRewardAdded(_pid, _amount);
+        } else {
+            pendingGaugeRewards[_pid] += _amount;
+            emit GaugeRewardQueued(_pid, _amount);
         }
-
-        pool.lastRewardBlock = block.number;
     }
 
     function depositFor(
@@ -364,7 +354,7 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
             uint256 balBefore = pool.lpToken.balanceOf(address(this));
             pool.lpToken.safeTransferFrom(msg.sender, address(this), _amount);
             uint256 received = pool.lpToken.balanceOf(address(this)) - balBefore;
-            require(received == _amount, "Fee-on-transfer/deflationary tokens not supported");
+            require(received == _amount, "fee-on-transfer not supported");
 
             credited = _amount;
             user.amount += credited;
@@ -504,14 +494,17 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         emit EmergencyWithdraw(msg.sender, _pid, amount);
     }
 
-    // ────────────────────────────── View Functions ──────────────────────────────
-
     function pendingReward(uint256 _pid, address _user) public view returns (uint256) {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
 
         uint256 acc = pool.accRewardPerShare;
         uint256 lpSupply = pool.totalStaked;
+        uint256 queued = pendingGaugeRewards[_pid];
+
+        if (lpSupply > 0 && queued > 0) {
+            acc += (queued * PRECISION_FACTOR) / lpSupply;
+        }
 
         if (
             block.number > pool.lastRewardBlock &&

@@ -1,4 +1,13 @@
 // SPDX-License-Identifier: MIT
+/// @title SimpleGauge
+/// @notice LP staking gauge distributing rewards over fixed weekly duration.
+/// @dev
+/// - Rewards MUST be supplied exclusively by the configured `minter`.
+/// - Owner can only set the minter; cannot inject rewards directly.
+/// - Emission flow: EmissionsMinter → SimpleGauge.notifyRewardAmount().
+/// - Reward rate is smoothed across DURATION and supports rollover.
+
+
 pragma solidity ^0.8.25;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -113,18 +122,28 @@ contract SimpleGauge is Ownable, Pausable, ReentrancyGuard {
         }
         getReward();
     }
+    
+    /// @notice Sets the emissions minter contract.
+    /// @dev Should be set to EmissionsMinter. Changing this affects reward flow security.
 
     function setMinter(address m) external onlyOwner {
+        require(m != address(0), "minter=0");
         minter = m;
         emit SetMinter(m);
     }
 
+    /// @notice Loads new rewards into the gauge.
+    /// @dev
+    /// - Callable ONLY by the configured minter.
+    /// - Supports leftover reward rollover from previous period.
+    /// - Reverts if reward rate exceeds available balance. 
+    
     function notifyRewardAmount(uint256 amount)
         external
         nonReentrant
         updateReward(address(0))
     {
-        require(msg.sender == minter || msg.sender == owner(), "not minter");
+        require(msg.sender == minter, "not minter");
         require(amount > 0, "amount=0");
 
         rewardToken.safeTransferFrom(msg.sender, address(this), amount);

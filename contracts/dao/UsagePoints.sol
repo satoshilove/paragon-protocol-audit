@@ -4,25 +4,7 @@ pragma solidity ^0.8.25;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
-interface IUsageHook {
-    function onPayflowExecuted(address user, uint256 usdVolume1e18, uint256 usdSaved1e18, bytes32 ref) external;
-    function onSwapExecuted(address user, uint256 usdVolume1e18, bytes32 ref) external;
-    function onLiquidityAdded(address user, uint256 usdValue1e18, bytes32 ref) external;
-    function onLiquidityRetained(address user, uint256 usdValue1e18, bytes32 ref) external;
-    function onP10Action(address user, uint256 usdValue1e18, bytes32 ref) external;
-    function onAgentRun(address user, uint256 complexity, bytes32 ref) external;
-}
-
-interface IUsagePointsView {
-    function pointsOf(address user, uint256 epoch) external view returns (uint256);
-    function totalOf(uint256 epoch) external view returns (uint256);
-    function multiplierBps(address user) external view returns (uint256);
-    function usageScoreOf(address user) external view returns (uint256);
-    function lastActiveAt(address user) external view returns (uint256);
-    function currentEpoch() external view returns (uint256);
-}
-
-contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
+contract UsagePoints is Ownable, Pausable {
     mapping(address => bool) public callers;
 
     modifier onlyCaller() {
@@ -32,6 +14,7 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
 
     uint256 public constant WEEK = 7 days;
     uint256 public constant DAY = 1 days;
+    uint256 public constant MAX_DECAY_DAYS = 90;
 
     enum ActionType {
         SWAP,
@@ -76,19 +59,26 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
     uint16 public wAgentBps = 0;
 
     event CallerSet(address indexed caller, bool allowed);
-    event CapsSet(uint256 swap, uint256 payflow, uint256 lpAdd, uint256 lpRetain, uint256 p10, uint256 agent, uint256 all);
-    event WeightsSet(uint16 swap, uint16 payVol, uint16 paySaved, uint16 lpAdd, uint16 lpRetain, uint16 p10, uint16 agent);
-    event DecayParamsSet(uint256 graceDays, uint256 decayBpsPerDay);
-    event UsageScoreUpdated(address indexed user, uint256 newScore, uint256 lastActive);
-    event PointsAdded(
-        address indexed user,
-        uint256 indexed epoch,
-        uint8 indexed actionType,
-        uint256 added,
-        uint256 userTotal,
-        uint256 epochTotal,
-        bytes32 ref
+    event DailyCapsSet(
+        uint256 swapCap,
+        uint256 payflowCap,
+        uint256 lpAddCap,
+        uint256 lpRetainCap,
+        uint256 p10Cap,
+        uint256 agentCap,
+        uint256 allTypesCap
     );
+    event WeightsSet(
+        uint16 swapVol,
+        uint16 payVol,
+        uint16 paySaved,
+        uint16 lpAdd,
+        uint16 lpRetain,
+        uint16 p10,
+        uint16 agent
+    );
+    event DecayParamsSet(uint256 gracePeriod, uint256 decayBpsPerDay);
+    event DecayApplied(address indexed user, uint256 newScore, uint256 lastDecayDayKey);
 
     constructor(address initialOwner) Ownable(initialOwner) {}
 
@@ -121,7 +111,8 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
         dailyCapP10Points = p10;
         dailyCapAgentPoints = agent;
         dailyCapAllTypes = all;
-        emit CapsSet(swap, payflow, lpAdd, lpRetain, p10, agent, all);
+
+        emit DailyCapsSet(swap, payflow, lpAdd, lpRetain, p10, agent, all);
     }
 
     function setWeights(
@@ -157,6 +148,7 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
         require(_decayBps <= 3_000, "decay too high");
         inactivityGrace = _grace;
         decayBpsPerDay = _decayBps;
+
         emit DecayParamsSet(_grace, _decayBps);
     }
 
@@ -172,75 +164,58 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
         _applyDecay(user);
     }
 
-    function onPayflowExecuted(address user, uint256 vol, uint256 saved, bytes32 ref)
-        external
-        onlyCaller
-        whenNotPaused
-    {
+    function onPayflowExecuted(address user, uint256 vol, uint256 saved, bytes32 ref) external onlyCaller whenNotPaused {
+        ref;
         if (user == address(0)) return;
 
         uint256 score;
         if (vol > 0) score += (vol * wPayVolBps) / 10_000;
         if (saved > 0) score += (saved * wPaySavedBps) / 10_000;
 
-        _accrue(user, ActionType.PAYFLOW, score, ref);
+        _accrue(user, ActionType.PAYFLOW, score);
     }
 
-    function onSwapExecuted(address user, uint256 vol, bytes32 ref)
-        external
-        onlyCaller
-        whenNotPaused
-    {
+    function onSwapExecuted(address user, uint256 vol, bytes32 ref) external onlyCaller whenNotPaused {
+        ref;
         if (user == address(0)) return;
+
         uint256 score = vol > 0 ? (vol * wSwapVolBps) / 10_000 : 0;
-        _accrue(user, ActionType.SWAP, score, ref);
+        _accrue(user, ActionType.SWAP, score);
     }
 
-    function onLiquidityAdded(address user, uint256 value, bytes32 ref)
-        external
-        onlyCaller
-        whenNotPaused
-    {
+    function onLiquidityAdded(address user, uint256 value, bytes32 ref) external onlyCaller whenNotPaused {
+        ref;
         if (user == address(0)) return;
+
         uint256 score = value > 0 ? (value * wLpAddBps) / 10_000 : 0;
-        _accrue(user, ActionType.LP_ADD, score, ref);
+        _accrue(user, ActionType.LP_ADD, score);
     }
 
-    function onLiquidityRetained(address user, uint256 value, bytes32 ref)
-        external
-        onlyCaller
-        whenNotPaused
-    {
+    function onLiquidityRetained(address user, uint256 value, bytes32 ref) external onlyCaller whenNotPaused {
+        ref;
         if (user == address(0)) return;
+
         uint256 score = value > 0 ? (value * wLpRetainBps) / 10_000 : 0;
-        _accrue(user, ActionType.LP_RETAIN, score, ref);
+        _accrue(user, ActionType.LP_RETAIN, score);
     }
 
-    function onP10Action(address user, uint256 value, bytes32 ref)
-        external
-        onlyCaller
-        whenNotPaused
-    {
+    function onP10Action(address user, uint256 value, bytes32 ref) external onlyCaller whenNotPaused {
+        ref;
         if (user == address(0)) return;
+
         uint256 score = value > 0 ? (value * wP10Bps) / 10_000 : 0;
-        _accrue(user, ActionType.P10, score, ref);
+        _accrue(user, ActionType.P10, score);
     }
 
-    function onAgentRun(address user, uint256 complexity, bytes32 ref)
-        external
-        onlyCaller
-        whenNotPaused
-    {
+    function onAgentRun(address user, uint256 complexity, bytes32 ref) external onlyCaller whenNotPaused {
+        ref;
         if (user == address(0) || complexity == 0) return;
 
-        uint256 score;
-        if (wAgentBps > 0) {
-            score = (complexity * uint256(wAgentBps) * 1e18) / 10_000;
-        } else {
-            score = 50e18 + (complexity * 1e18) / 10;
-        }
+        uint256 score = wAgentBps > 0
+            ? (complexity * uint256(wAgentBps) * 1e18) / 10_000
+            : 50e18 + (complexity * 1e18) / 10;
 
-        _accrue(user, ActionType.AGENT, score, ref);
+        _accrue(user, ActionType.AGENT, score);
     }
 
     function pointsOf(address user, uint256 epoch_) external view returns (uint256) {
@@ -262,25 +237,6 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
     function multiplierBps(address user) public view returns (uint256) {
         uint256 s = usageScore[user];
         if (s == 0) s = SCORE_FLOOR;
-
-        uint256 last = lastActiveTs[user];
-        if (last > 0 && block.timestamp > last + inactivityGrace) {
-            uint256 today = dayKey();
-            uint256 ld = lastDecayDay[user];
-            if (ld == 0) ld = today;
-
-            uint256 daysPassed = today > ld ? today - ld : 0;
-            if (daysPassed > 365) daysPassed = 365;
-
-            uint256 keep = 10_000 - decayBpsPerDay;
-            for (uint256 i = 0; i < daysPassed; ++i) {
-                s = (s * keep) / 10_000;
-                if (s <= SCORE_FLOOR) {
-                    s = SCORE_FLOOR;
-                    break;
-                }
-            }
-        }
 
         uint256 low = 1_000e18;
         uint256 mid = 7_000e18;
@@ -310,11 +266,10 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
         return dailyCapAgentPoints;
     }
 
-    function _accrue(address user, ActionType t, uint256 raw, bytes32 ref) internal {
+    function _accrue(address user, ActionType t, uint256 raw) internal {
         if (raw == 0) return;
 
         _applyDecay(user);
-
         uint256 d = dayKey();
 
         if (dailyCapAllTypes > 0) {
@@ -327,9 +282,7 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
                 dailyAccrued[user][d][uint8(ActionType.AGENT)];
 
             if (todayTotal >= dailyCapAllTypes) return;
-            if (todayTotal + raw > dailyCapAllTypes) {
-                raw = dailyCapAllTypes - todayTotal;
-            }
+            if (todayTotal + raw > dailyCapAllTypes) raw = dailyCapAllTypes - todayTotal;
         }
 
         uint256 cap = _capFor(t);
@@ -355,9 +308,6 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
 
         usageScore[user] = s;
         lastActiveTs[user] = block.timestamp;
-
-        emit UsageScoreUpdated(user, s, block.timestamp);
-        emit PointsAdded(user, ep, uint8(t), raw, points[ep][user], totalPoints[ep], ref);
     }
 
     function _applyDecay(address user) internal {
@@ -366,17 +316,20 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
         if (s == 0) {
             usageScore[user] = SCORE_FLOOR;
             lastDecayDay[user] = dayKey();
+            emit DecayApplied(user, SCORE_FLOOR, dayKey());
             return;
         }
 
         uint256 last = lastActiveTs[user];
         if (last == 0) {
             lastDecayDay[user] = dayKey();
+            emit DecayApplied(user, s, dayKey());
             return;
         }
 
         if (block.timestamp <= last + inactivityGrace) {
             lastDecayDay[user] = dayKey();
+            emit DecayApplied(user, s, dayKey());
             return;
         }
 
@@ -386,7 +339,7 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
         if (today <= ld) return;
 
         uint256 daysPassed = today - ld;
-        if (daysPassed > 365) daysPassed = 365;
+        if (daysPassed > MAX_DECAY_DAYS) daysPassed = MAX_DECAY_DAYS;
 
         uint256 keep = 10_000 - decayBpsPerDay;
         for (uint256 i = 0; i < daysPassed; ++i) {
@@ -399,5 +352,7 @@ contract UsagePoints is Ownable, Pausable, IUsageHook, IUsagePointsView {
 
         usageScore[user] = s;
         lastDecayDay[user] = today;
+
+        emit DecayApplied(user, s, today);
     }
 }
