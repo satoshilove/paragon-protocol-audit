@@ -96,7 +96,8 @@ contract ParagonRouterGuard is Ownable {
     function validatePostSwap(
         uint256 effectiveIn,
         address[] calldata path,
-        uint256 actualOut
+        uint256 actualOut,
+        uint256 expectedOutPreSwap
     ) external view {
         if (!enabled || !_pathHasProtected(path)) return;
 
@@ -117,10 +118,9 @@ contract ParagonRouterGuard is Ownable {
             require(actualOut >= minOut, "Paragon: ORACLE_SLIPPAGE");
         }
 
-        uint256[] memory amountsPre = ParagonLibrary.getAmountsOut(factory, effectiveIn, path);
-        uint256 expectedOutPre = amountsPre[amountsPre.length - 1];
+        require(expectedOutPreSwap > 0, "Paragon: BAD_PREQUOTE");
 
-        uint16 impactOverall = _impactBipsOverall(expectedOutPre, actualOut);
+        uint16 impactOverall = _impactBipsOverall(expectedOutPreSwap, actualOut);
         uint256 allowed = uint256(admin.maxPriceImpactBips()) + extra;
         if (allowed > 2000) allowed = 2000;
 

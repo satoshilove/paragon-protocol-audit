@@ -11,7 +11,31 @@ interface IPausableToken {
 }
 
 /// @notice Router policy/config contract read by ParagonRouter (whitelist + tolerances + helper views)
-/// @dev Keep this contract "dumb": store config + expose helpers. The Router enforces.
+/// @dev
+/// This contract is intentionally "dumb":
+/// - it stores policy/config values consumed by the Router / RouterGuard
+/// - it exposes helper / estimation / UI-oriented validation functions
+///
+/// IMPORTANT DESIGN NOTE:
+/// The helper functions in this contract are NOT execution guarantees.
+/// Actual swap acceptance is determined at execution time by ParagonRouter
+/// and, where configured, ParagonRouterGuard using live reserves, actual input,
+/// oracle checks, fee-on-transfer tolerance, and post-swap conditions.
+///
+/// In particular, helper functions such as:
+/// - checkSlippageExactOut
+/// - getPathPriceImpact
+/// - checkPriceImpactMultiHop
+/// - isSwapSafe
+/// - calculateOptimalSlippage
+/// - getMaxSwapAmount
+///
+/// should be treated as off-chain / UI guidance only.
+///
+/// Integrators MUST NOT assume that a positive helper result guarantees
+/// successful execution, because live Router / Guard enforcement may differ
+/// due to reserve changes, oracle state, FoT behavior, protected-token paths,
+/// and post-swap validation rules.
 contract ParagonRouterAdmin is Ownable {
     // -------------------- Core config --------------------
     uint32 public maxSlippageBips = 50;           // 0.5%
@@ -123,6 +147,8 @@ contract ParagonRouterAdmin is Ownable {
     // Validation helpers (optional UI calls)
     // ==========================
 
+    /// @notice Pure path-shape validation helper for UI / off-chain callers.
+    /// @dev This does NOT guarantee a live swap will succeed.
     function validatePath(address[] calldata path) external pure returns (bool valid) {
         if (path.length < 2 || path.length > 5) return false;
         for (uint i; i < path.length - 1; i++) {
@@ -132,7 +158,8 @@ contract ParagonRouterAdmin is Ownable {
         return true;
     }
 
-    /// @notice Enforces XPGN paused() if path touches XPGN
+    /// @notice Enforces XPGN paused() if path touches XPGN.
+    /// @dev This mirrors only the paused-token check and is not a full execution guarantee.
     function checkXpgnNotPaused(address factory, address[] calldata path) external view {
         address xpgn = IParagonFactory(factory).xpgnToken();
         if (xpgn == address(0)) return;
@@ -145,9 +172,15 @@ contract ParagonRouterAdmin is Ownable {
         }
     }
 
-    /// @notice Multi-hop price impact check using improved approximation
-    /// Uses ×2 factor: ≈ 2 × amountIn / (reserveIn + amountIn) for marginal impact
-    /// PAD-34 FIX: uses per-hop effective fee (honors per-pair overrides)
+    /// @notice Heuristic multi-hop price impact check for UI / off-chain guidance.
+    /// @dev
+    /// This is NOT identical to live Router / Guard execution-time validation.
+    /// It uses an approximation:
+    ///   impact ≈ 2 × amountIn / (reserveIn + amountIn)
+    /// and progresses hop inputs using current reserve math and effective per-hop fees.
+    ///
+    /// Actual execution may still fail due to reserve movement, oracle requirements,
+    /// fee-on-transfer behavior, protected-token checks, or post-swap guard validation.
     function checkPriceImpactMultiHop(address factory, uint amountIn, address[] calldata path) external view {
         require(path.length >= 2, "INVALID_PATH");
 
@@ -169,7 +202,11 @@ contract ParagonRouterAdmin is Ownable {
         }
     }
 
-    /// @notice Exact-out slippage guard helper (UI / off-chain precheck)
+    /// @notice Exact-out slippage precheck helper for UI / off-chain guidance.
+    /// @dev
+    /// This estimates whether amountInMax is likely sufficient under current reserves.
+    /// It is NOT a guarantee of success under live Router / Guard enforcement.
+    ///
     /// PAD-34 FIX: for 2-hop direct math, uses effective per-pair fee (honors overrides)
     function checkSlippageExactOut(address factory, uint amountOut, uint amountInMax, address[] calldata path) external view {
         require(path.length >= 2, "INVALID_PATH");
@@ -222,8 +259,14 @@ contract ParagonRouterAdmin is Ownable {
         );
     }
 
-    /// @notice Computes max swap amount using improved ×2 impact approximation
-    /// @dev Fee does not affect this bound; it's purely reserve-based.
+    /// @notice Returns a heuristic max swap size estimate for UI guidance.
+    /// @dev
+    /// This estimate is reserve-based and uses the configured maxPriceImpactBips threshold.
+    /// It is most meaningful for direct swaps (path.length == 2).
+    ///
+    /// For multi-hop paths, each hop has a different input-token unit context, so the
+    /// minimum bound across hops should be treated as guidance only, not a precise
+    /// execution-safe limit.
     function getMaxSwapAmount(address factory, address[] calldata path) external view returns (uint maxAmount) {
         require(path.length >= 2, "INVALID_PATH");
         uint32 maxImpact = maxPriceImpactBips;
@@ -244,8 +287,10 @@ contract ParagonRouterAdmin is Ownable {
         }
     }
 
-    /// @notice Returns per-hop price impact using improved ×2 approximation
-    /// PAD-34 FIX: intermediate amount progression uses per-hop effective fees
+    /// @notice Returns per-hop heuristic price impact estimates for UI / off-chain callers.
+    /// @dev
+    /// These are estimates only and are not identical to execution-time Router / Guard logic.
+    /// PAD-34 FIX: intermediate amount progression uses per-hop effective fees.
     function getPathPriceImpact(address factory, uint amountIn, address[] calldata path)
         external
         view
@@ -271,7 +316,9 @@ contract ParagonRouterAdmin is Ownable {
         }
     }
 
-    /// @notice Suggests slippage based on estimated path impact (now using ×2 values)
+    /// @notice Suggests a heuristic slippage setting based on estimated path impact.
+    /// @dev
+    /// This is UI guidance only and is not a promise that the Router / Guard will accept the swap.
     function calculateOptimalSlippage(address factory, uint amountIn, address[] calldata path)
         external
         view
@@ -292,6 +339,19 @@ contract ParagonRouterAdmin is Ownable {
         optimalSlippage = dyn > maxSlippageBips ? maxSlippageBips : dyn;
     }
 
+    /// @notice High-level safety helper for UI / off-chain callers.
+    /// @dev
+    /// This function is heuristic only. A `true` result does NOT guarantee execution success.
+    /// Live Router / Guard checks may still fail because of:
+    /// - reserve movement between quote and execution
+    /// - oracle validation differences
+    /// - fee-on-transfer behavior
+    /// - protected-token checks
+    /// - post-swap validation rules
+    ///
+    /// For direct swaps (path.length == 2), this also compares amountIn against getMaxSwapAmount().
+    /// For multi-hop paths, getMaxSwapAmount() is not directly comparable hop-by-hop in a strict
+    /// execution sense because units differ across hops, so this check is intentionally omitted.
     function isSwapSafe(address factory, uint amountIn, address[] calldata path)
         external
         view
@@ -304,7 +364,7 @@ contract ParagonRouterAdmin is Ownable {
         }
 
         try this.checkPriceImpactMultiHop(factory, amountIn, path) {
-            // ✅ PAD-38 FIX:
+            // PAD-38 FIX:
             // getMaxSwapAmount() returns a per-hop bound denominated in that hop's input token.
             // For multi-hop paths, the minimum hop bound may be in path[i] units (i>0),
             // so only compare directly against amountIn for direct swaps.

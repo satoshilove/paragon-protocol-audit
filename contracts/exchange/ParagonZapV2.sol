@@ -655,6 +655,18 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         return (amount * (BPS_DENOM - slippageBps)) / BPS_DENOM;
     }
 
+    function _isUnderlyingOfPair(address maybePair, address token) internal view returns (bool) {
+        try IParagonPair(maybePair).token0() returns (address t0) {
+            try IParagonPair(maybePair).token1() returns (address t1) {
+                return token == t0 || token == t1;
+            } catch {
+                return false;
+            }
+        } catch {
+            return false;
+        }
+    }
+
     function updateProtocolConfig(ProtocolConfig calldata newConfig) external onlyOwner {
         if (newConfig.platformFeeBps > MAX_PLATFORM_FEE) revert FeeTooHigh();
         if (newConfig.referralFeeBps > MAX_REFERRAL_FEE) revert FeeTooHigh();
@@ -669,21 +681,29 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
 
     function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
         uint256 n = farm.poolLength();
+
         for (uint256 pid = 0; pid < n; pid++) {
             (IERC20 lpTokenErc20, , , , , , ) = farm.poolInfo(pid);
             address lpToken = address(lpTokenErc20);
+
             if (lpToken == address(0)) continue;
+
+            // Never rescue the pool token itself
             if (token == lpToken) revert TokenNotRescuable();
-            IParagonPair p = IParagonPair(lpToken);
-            if (token == p.token0() || token == p.token1()) revert TokenNotRescuable();
+
+            // Only treat it as a pair if token0()/token1() succeed.
+            // This prevents non-pair pools from breaking the rescue flow.
+            if (_isUnderlyingOfPair(lpToken, token)) revert TokenNotRescuable();
         }
 
         if (token == WNATIVE) revert TokenNotRescuable();
 
         if (token == address(0)) {
+            require(address(this).balance >= amount, "insufficient native");
             (bool ok,) = owner().call{value: amount}("");
             require(ok, "transfer fail");
         } else {
+            require(IERC20(token).balanceOf(address(this)) >= amount, "insufficient token");
             IERC20(token).safeTransfer(owner(), amount);
         }
 

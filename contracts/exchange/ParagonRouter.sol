@@ -34,7 +34,8 @@ interface IParagonRouterGuard {
     function validatePostSwap(
         uint256 effectiveIn,
         address[] calldata path,
-        uint256 actualOut
+        uint256 actualOut,
+        uint256 expectedOutPreSwap
     ) external view;
 }
 
@@ -68,7 +69,6 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     // Per-user auto-yield preference (percent 0..3). 255 = use saved pref in swap calls.
     mapping(address => uint8) public userAutoYieldBips;
     uint8 private constant USE_SAVED_PREF = 255;
-
 
     constructor(address _factory, address _WNative, address _masterChef) Ownable(msg.sender) {
         require(_factory != address(0) && _WNative != address(0) && _masterChef != address(0), "Paragon: ZERO");
@@ -154,10 +154,11 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
     function _enforceGuardPostSwap(
         uint256 effectiveIn,
         address[] memory pth,
-        uint256 actualOut
+        uint256 actualOut,
+        uint256 expectedOutPreSwap
     ) internal view {
         if (address(guard) == address(0)) return;
-        guard.validatePostSwap(effectiveIn, pth, actualOut);
+        guard.validatePostSwap(effectiveIn, pth, actualOut, expectedOutPreSwap);
     }
 
     // =========================================================
@@ -864,11 +865,14 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         uint256 effectiveIn = _firstHopEffectiveIn(inputToken, r[1], firstPair);
         require(effectiveIn > 0, "Paragon: INSUFF_INPUT");
 
+        uint256[] memory expectedAmountsPre = ParagonLibrary.getAmountsOut(factory, effectiveIn, r);
+        uint256 expectedOutPreSwap = expectedAmountsPre[expectedAmountsPre.length - 1];
+
         uint256 beforeBal = IERC20(outToken).balanceOf(finalTo);
         ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(r, factory, finalTo);
         amountOut = IERC20(outToken).balanceOf(finalTo) - beforeBal;
 
-        _enforceGuardPostSwap(effectiveIn, r, amountOut);
+        _enforceGuardPostSwap(effectiveIn, r, amountOut, expectedOutPreSwap);
 
         require(amountOut >= grossMin, "Paragon: INSUFF_OUTPUT");
 
@@ -927,11 +931,14 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         uint256 effectiveIn = _firstHopEffectiveIn(WNative, r[1], firstPair);
         require(effectiveIn > 0, "Paragon: INSUFF_INPUT");
 
+        uint256[] memory expectedAmountsPre = ParagonLibrary.getAmountsOut(factory, effectiveIn, r);
+        uint256 expectedOutPreSwap = expectedAmountsPre[expectedAmountsPre.length - 1];
+
         uint256 beforeBal = IERC20(outToken).balanceOf(finalTo);
         ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(r, factory, finalTo);
         amountOut = IERC20(outToken).balanceOf(finalTo) - beforeBal;
 
-        _enforceGuardPostSwap(effectiveIn, r, amountOut);
+        _enforceGuardPostSwap(effectiveIn, r, amountOut, expectedOutPreSwap);
 
         require(amountOut >= grossMin, "Paragon: INSUFF_OUTPUT");
 
@@ -980,11 +987,14 @@ contract ParagonRouter is IParagonRouter, Ownable, Pausable, ReentrancyGuard {
         uint256 effectiveIn = _firstHopEffectiveIn(inputToken, r[1], firstPair);
         require(effectiveIn > 0, "Paragon: INSUFF_INPUT");
 
+        uint256[] memory expectedAmountsPre = ParagonLibrary.getAmountsOut(factory, effectiveIn, r);
+        uint256 expectedOutPreSwap = expectedAmountsPre[expectedAmountsPre.length - 1];
+
         uint256 beforeBal = IERC20(WNative).balanceOf(address(this));
         ParagonRouterSwapHelper.swapSupportingFeeOnTransferTokens(r, factory, address(this));
         uint256 wReceived = IERC20(WNative).balanceOf(address(this)) - beforeBal;
 
-        _enforceGuardPostSwap(effectiveIn, r, wReceived);
+        _enforceGuardPostSwap(effectiveIn, r, wReceived, expectedOutPreSwap);
 
         require(wReceived >= amountOutMin, "Paragon: INSUFF_OUTPUT");
 
