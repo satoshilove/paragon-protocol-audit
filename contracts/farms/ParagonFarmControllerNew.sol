@@ -24,7 +24,9 @@ interface IRewardDripper {
 
 /// @title ParagonFarmController
 /// @notice MasterChef-style farm with veXPGN gauge integration
-/// @dev Core logic unchanged; only minimal controlled notifyGaugeReward hook added
+/// @dev Updated to fix:
+/// - PAD-57 queued gauge reward application inconsistency
+/// - PAD-58 cross-pool reward balance leakage
 contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -80,6 +82,10 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
     address public gaugeDistributor;
     mapping(uint256 => uint256) public pendingGaugeRewards;
 
+    // Per-pool reserve isolation
+    mapping(uint256 => uint256) public poolRewardReserve;
+    uint256 public totalRewardReserved;
+
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event Harvest(address indexed user, uint256 indexed pid, uint256 netAmount);
@@ -91,7 +97,7 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
     event EmissionsPaused(bool paused);
     event PerformanceFeeUpdated(address indexed recipient, uint16 feeBips);
     event HarvestFeeTaken(address indexed user, uint256 indexed pid, uint256 feeAmount);
-    event DripperPoked(uint256 sent, uint256 availableAfter);
+    event DripperPoked(uint256 sent, uint256 freeLiquidityAfter);
     event DripperConfigUpdated(address dripper, uint256 lowWaterDays, uint64 cooldown, uint256 minDrip);
     event AutoYieldCallerUpdated(address indexed caller, bool allowed);
     event OwnershipAndAdminTransferred(address indexed previousOwner, address indexed newOwner);
@@ -99,6 +105,9 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
     event GaugeDistributorUpdated(address indexed distributor);
     event GaugeRewardAdded(uint256 indexed pid, uint256 amount);
     event GaugeRewardQueued(uint256 indexed pid, uint256 amount);
+    event PoolRewardReserved(uint256 indexed pid, uint256 amount, uint256 newPoolReserve);
+    event PoolRewardReleased(uint256 indexed pid, uint256 amount, uint256 newPoolReserve);
+    event PoolRewardReserveAdjusted(uint256 indexed pid, uint256 oldReserve, uint256 newReserve);
 
     constructor(
         address initialOwner,
@@ -219,6 +228,22 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         emit GaugeDistributorUpdated(_dist);
     }
 
+    /// @dev Owner-only repair hook in case reserve accounting ever needs manual correction.
+    /// Uses massUpdateAllPools() first so accounting is settled before mutation.
+    function setPoolRewardReserve(uint256 _pid, uint256 newReserve) external onlyOwner {
+        massUpdateAllPools();
+        uint256 oldReserve = poolRewardReserve[_pid];
+
+        if (newReserve > oldReserve) {
+            totalRewardReserved += (newReserve - oldReserve);
+        } else if (oldReserve > newReserve) {
+            totalRewardReserved -= (oldReserve - newReserve);
+        }
+
+        poolRewardReserve[_pid] = newReserve;
+        emit PoolRewardReserveAdjusted(_pid, oldReserve, newReserve);
+    }
+
     function addPool(uint256 _allocPoint, IERC20 _lpToken, uint256 _harvestDelay) external onlyOwner {
         require(address(_lpToken) != address(0), "lpToken=0");
         require(poolInfo.length < 300, "max pools reached");
@@ -255,7 +280,7 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         if (block.timestamp < lastDripAt + dripCooldownSecs) return;
 
         uint256 need = rewardPerBlock * 115200 * lowWaterDays;
-        if (_availableRewards() >= need) return;
+        if (_freeRewardLiquidity() >= need) return;
 
         try dripper.pendingAccrued() returns (uint256 p) {
             if (p >= minDripAmount) {
@@ -263,7 +288,7 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
                     if (sent > 0) {
                         lastDripAt = uint64(block.timestamp);
                     }
-                    emit DripperPoked(sent, _availableRewards());
+                    emit DripperPoked(sent, _freeRewardLiquidity());
                 } catch {}
             }
         } catch {}
@@ -284,28 +309,28 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         _maybeTopUpFromDripper();
         PoolInfo storage pool = poolInfo[_pid];
 
+        uint256 lpSupply = pool.totalStaked;
         uint256 queued = pendingGaugeRewards[_pid];
 
+        // PAD-57 fix:
+        // Apply queued gauge rewards deterministically whenever there is stake.
+        // No dependency on emissionsPaused or totalAllocPoint.
+        if (queued > 0 && lpSupply > 0) {
+            pendingGaugeRewards[_pid] = 0;
+            pool.accRewardPerShare += (queued * PRECISION_FACTOR) / lpSupply;
+        }
+
         if (block.number > pool.lastRewardBlock) {
-            uint256 lpSupply = pool.totalStaked;
-
             if (lpSupply > 0 && totalAllocPoint > 0 && !emissionsPaused) {
-                if (queued > 0) {
-                    pendingGaugeRewards[_pid] = 0;
-                    pool.accRewardPerShare += (queued * PRECISION_FACTOR) / lpSupply;
-                }
-
                 uint256 blocks = block.number - pool.lastRewardBlock;
                 uint256 reward = (blocks * rewardPerBlock * pool.allocPoint) / totalAllocPoint;
+
                 if (reward > 0) {
+                    _reservePoolRewards(_pid, reward);
                     pool.accRewardPerShare += (reward * PRECISION_FACTOR) / lpSupply;
                 }
             }
 
-            pool.lastRewardBlock = block.number;
-        } else if (queued > 0 && pool.totalStaked > 0) {
-            pendingGaugeRewards[_pid] = 0;
-            pool.accRewardPerShare += (queued * PRECISION_FACTOR) / pool.totalStaked;
             pool.lastRewardBlock = block.number;
         }
     }
@@ -317,9 +342,13 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
 
         rewardToken.safeTransferFrom(msg.sender, address(this), _amount);
 
-        PoolInfo storage pool = poolInfo[_pid];
+        // Settle pool before crediting new reward amount.
         updatePool(_pid);
 
+        // Reserve the newly funded gauge amount exactly once, here.
+        _reservePoolRewards(_pid, _amount);
+
+        PoolInfo storage pool = poolInfo[_pid];
         if (pool.totalStaked > 0) {
             pool.accRewardPerShare += (_amount * PRECISION_FACTOR) / pool.totalStaked;
             emit GaugeRewardAdded(_pid, _amount);
@@ -399,10 +428,13 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
             return;
         }
 
-        uint256 available = _availableRewards();
-        uint256 pay = gross > available ? available : gross;
+        uint256 availableGlobal = _payableRewardLiquidity();
+        uint256 availablePool = poolRewardReserve[_pid];
+        uint256 pay = _min3(gross, availableGlobal, availablePool);
 
         if (pay > 0) {
+            _releasePoolRewards(_pid, pay);
+
             uint256 fee = performanceFeeBips > 0 ? (pay * performanceFeeBips) / 10000 : 0;
             uint256 net = pay - fee;
 
@@ -434,10 +466,13 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
 
         bool canHarvest = gross > 0 && block.timestamp >= user.lastDepositTime + pool.harvestDelay;
         if (canHarvest) {
-            uint256 available = _availableRewards();
-            uint256 pay = gross > available ? available : gross;
+            uint256 availableGlobal = _payableRewardLiquidity();
+            uint256 availablePool = poolRewardReserve[_pid];
+            uint256 pay = _min3(gross, availableGlobal, availablePool);
 
             if (pay > 0) {
+                _releasePoolRewards(_pid, pay);
+
                 uint256 fee = performanceFeeBips > 0 ? (pay * performanceFeeBips) / 10000 : 0;
                 uint256 net = pay - fee;
 
@@ -479,6 +514,11 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         uint256 amount = user.amount;
         require(amount > 0, "nothing to withdraw");
 
+        // Settle pool first so user accounting is consistent.
+        updatePool(_pid);
+
+        // User forfeits rewards. Do NOT release reserve here.
+        // This keeps economics conservative and avoids changing emergency behavior.
         user.amount = 0;
         user.rewardDebt = 0;
         user.unpaid = 0;
@@ -517,7 +557,11 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
             acc += (reward * PRECISION_FACTOR) / lpSupply;
         }
 
-        return user.unpaid + ((user.amount * acc) / PRECISION_FACTOR - user.rewardDebt);
+        uint256 gross = user.unpaid + ((user.amount * acc) / PRECISION_FACTOR - user.rewardDebt);
+
+        // View now respects reserve isolation for more realistic UI expectations.
+        uint256 reserveCap = poolRewardReserve[_pid];
+        return gross > reserveCap ? reserveCap : gross;
     }
 
     function pendingRewardAfterFee(uint256 _pid, address _user)
@@ -541,16 +585,56 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
         return net;
     }
 
-    function _availableRewards() internal view returns (uint256) {
+    /// @notice Original behavior: gross payable reward balance excluding staked reward-token LP.
+    function _payableRewardLiquidity() internal view returns (uint256) {
         uint256 bal = rewardToken.balanceOf(address(this));
         return bal > totalRewardTokenStakedAsLP ? bal - totalRewardTokenStakedAsLP : 0;
     }
 
+    /// @notice Free unreserved reward liquidity after excluding pool-reserved obligations.
+    function _freeRewardLiquidity() internal view returns (uint256) {
+        uint256 payableBal = _payableRewardLiquidity();
+        return payableBal > totalRewardReserved ? payableBal - totalRewardReserved : 0;
+    }
+
+    /// @notice Backward-compatible gross available amount.
     function availableRewards() external view returns (uint256) {
-        return _availableRewards();
+        return _payableRewardLiquidity();
+    }
+
+    function payableRewards() external view returns (uint256) {
+        return _payableRewardLiquidity();
+    }
+
+    function freeRewardLiquidity() external view returns (uint256) {
+        return _freeRewardLiquidity();
     }
 
     function poolLength() external view returns (uint256) {
         return poolInfo.length;
+    }
+
+    function _reservePoolRewards(uint256 _pid, uint256 amount) internal {
+        if (amount == 0) return;
+        poolRewardReserve[_pid] += amount;
+        totalRewardReserved += amount;
+        emit PoolRewardReserved(_pid, amount, poolRewardReserve[_pid]);
+    }
+
+    function _releasePoolRewards(uint256 _pid, uint256 amount) internal {
+        if (amount == 0) return;
+
+        uint256 reserved = poolRewardReserve[_pid];
+        require(reserved >= amount, "pool reserve insufficient");
+
+        poolRewardReserve[_pid] = reserved - amount;
+        totalRewardReserved -= amount;
+
+        emit PoolRewardReleased(_pid, amount, poolRewardReserve[_pid]);
+    }
+
+    function _min3(uint256 a, uint256 b, uint256 c) internal pure returns (uint256) {
+        uint256 m = a < b ? a : b;
+        return m < c ? m : c;
     }
 }

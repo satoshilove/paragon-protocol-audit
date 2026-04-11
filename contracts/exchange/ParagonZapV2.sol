@@ -176,7 +176,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
         WNATIVE = router.WNative();
         farm = IParagonFarm(_farm);
 
-        if (_feeRecipient == address(0) || _feeRecipient.code.length > 0) revert InvalidFeeRecipient();
+        if (_feeRecipient == address(0)) revert InvalidFeeRecipient();
 
         config = ProtocolConfig({
             platformFeeBps: 25,
@@ -670,7 +670,7 @@ contract ParagonZapV2 is Ownable, ReentrancyGuard, Pausable {
     function updateProtocolConfig(ProtocolConfig calldata newConfig) external onlyOwner {
         if (newConfig.platformFeeBps > MAX_PLATFORM_FEE) revert FeeTooHigh();
         if (newConfig.referralFeeBps > MAX_REFERRAL_FEE) revert FeeTooHigh();
-        if (newConfig.feeRecipient == address(0) || newConfig.feeRecipient.code.length > 0) revert InvalidFeeRecipient();
+        if (newConfig.feeRecipient == address(0)) revert InvalidFeeRecipient();
         if (newConfig.swapFeeBps > 100) revert FeeTooHigh();
         config = newConfig;
         emit ProtocolConfigUpdated(newConfig);
