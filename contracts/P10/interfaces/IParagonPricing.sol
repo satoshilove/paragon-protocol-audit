@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity ^0.8.27;
 
 interface IParagonRouter {
     /// @notice Swap exact tokens in for minAmountOut of a target token.

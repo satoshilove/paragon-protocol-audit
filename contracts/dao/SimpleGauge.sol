@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 /// @title SimpleGauge
 /// @notice LP staking gauge distributing rewards over fixed weekly duration.
 /// @dev

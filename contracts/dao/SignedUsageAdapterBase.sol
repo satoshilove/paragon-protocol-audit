@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -8,6 +8,8 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 abstract contract SignedUsageAdapterBase is Ownable, Pausable, ReentrancyGuard {
     using ECDSA for bytes32;
+
+    uint256 public constant WEEK = 7 days;
 
     struct UsageClaim {
         address user;
@@ -19,7 +21,6 @@ abstract contract SignedUsageAdapterBase is Ownable, Pausable, ReentrancyGuard {
 
     bytes32 public immutable DOMAIN_SEPARATOR;
 
-    // keccak256("UsageClaim(address user,uint256 usdValue1e18,bytes32 ref,uint256 epoch,uint256 deadline)")
     bytes32 public constant USAGE_CLAIM_TYPEHASH =
         keccak256("UsageClaim(address user,uint256 usdValue1e18,bytes32 ref,uint256 epoch,uint256 deadline)");
 
@@ -27,7 +28,13 @@ abstract contract SignedUsageAdapterBase is Ownable, Pausable, ReentrancyGuard {
     mapping(bytes32 => bool) public usedDigest;
 
     event SignerSet(address indexed signer, bool allowed);
-    event ClaimConsumed(bytes32 indexed digest, address indexed user, bytes32 indexed ref, uint256 usdValue1e18, uint256 epoch);
+    event ClaimConsumed(
+        bytes32 indexed digest,
+        address indexed user,
+        bytes32 indexed ref,
+        uint256 usdValue1e18,
+        uint256 epoch
+    );
     event EmergencyPause(address indexed owner);
     event EmergencyUnpause(address indexed owner);
 
@@ -49,6 +56,10 @@ abstract contract SignedUsageAdapterBase is Ownable, Pausable, ReentrancyGuard {
     }
 
     function _domainName() internal view virtual returns (string memory);
+
+    function currentEpoch() public view returns (uint256) {
+        return block.timestamp / WEEK;
+    }
 
     function setSigner(address signer, bool allowed) external onlyOwner {
         require(signer != address(0), "signer=0");
@@ -81,10 +92,14 @@ abstract contract SignedUsageAdapterBase is Ownable, Pausable, ReentrancyGuard {
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
     }
 
-    function _verifyAndConsume(UsageClaim calldata c, bytes calldata signature) internal returns (bytes32 digest) {
+    function _verifyAndConsume(UsageClaim calldata c, bytes calldata signature)
+        internal
+        returns (bytes32 digest)
+    {
         require(c.user != address(0), "user=0");
         require(c.usdValue1e18 > 0, "value=0");
         require(c.deadline >= block.timestamp, "expired");
+        require(c.epoch == currentEpoch(), "wrong epoch");
 
         digest = hashClaim(c);
         require(!usedDigest[digest], "claim used");

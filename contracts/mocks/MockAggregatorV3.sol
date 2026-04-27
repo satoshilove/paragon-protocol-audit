@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 interface AggregatorV3Interface {
     function latestRoundData() external view returns (uint80,int256,uint256,uint256,uint80);

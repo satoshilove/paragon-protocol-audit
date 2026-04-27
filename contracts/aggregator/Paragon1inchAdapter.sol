@@ -21,6 +21,12 @@ interface I1inchRouterV6 {
     function swap(
         address executor,
         SwapDescription calldata desc,
+        bytes calldata data
+    ) external payable returns (uint256 returnAmount, uint256 spentAmount);
+
+    function swap(
+        address executor,
+        SwapDescription calldata desc,
         bytes calldata permit,
         bytes calldata data
     ) external payable returns (uint256 returnAmount, uint256 spentAmount);
@@ -152,8 +158,19 @@ contract Paragon1inchAdapter is Ownable2Step, ReentrancyGuard, Pausable {
         }
         if (desc.amount != amountIn) revert AmountMismatch();
         if (desc.minReturnAmount < minAmountOut) revert MinReturnTooLow();
-        if (desc.srcReceiver != payable(address(this))) revert BadSrcReceiver();
         if (desc.dstReceiver != payable(address(this))) revert BadDstReceiver();
+
+        // 1inch routes can source tokens either directly from the adapter or
+        // through a specific executor. We keep this narrow: only adapter
+        // custody or the explicitly approved executor are accepted.
+        bool validSrcReceiver =
+            desc.srcReceiver == payable(address(this)) ||
+            (
+                executor != address(0) &&
+                allowedExecutors[executor] &&
+                desc.srcReceiver == payable(executor)
+            );
+        if (!validSrcReceiver) revert BadSrcReceiver();
 
         uint256 tokenInBefore = IERC20(tokenIn).balanceOf(address(this));
         if (tokenInBefore < amountIn) revert AmountMismatch();
@@ -163,12 +180,22 @@ contract Paragon1inchAdapter is Ownable2Step, ReentrancyGuard, Pausable {
         // Approve exact amount to current 1inch router.
         IERC20(tokenIn).forceApprove(oneInchRouter, amountIn);
 
-        (uint256 returnAmount, uint256 spentAmount) = I1inchRouterV6(oneInchRouter).swap(
-            executor,
-            desc,
-            permitData,
-            oneInchData
-        );
+        uint256 returnAmount;
+        uint256 spentAmount;
+        if (permitData.length == 0) {
+            (returnAmount, spentAmount) = I1inchRouterV6(oneInchRouter).swap(
+                executor,
+                desc,
+                oneInchData
+            );
+        } else {
+            (returnAmount, spentAmount) = I1inchRouterV6(oneInchRouter).swap(
+                executor,
+                desc,
+                permitData,
+                oneInchData
+            );
+        }
 
         // Always clear approval after execution.
         IERC20(tokenIn).forceApprove(oneInchRouter, 0);

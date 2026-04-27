@@ -1,5 +1,5 @@
 // contracts/mocks/MockReputationOperator.sol
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 
 contract MockReputationOperator {

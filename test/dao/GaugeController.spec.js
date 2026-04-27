@@ -1,67 +1,102 @@
 /* eslint-disable node/no-unpublished-require */
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { timeTravel } = require("../helpers"); // chain-time helper
+
+const E = (n) => ethers.parseEther(n);
+const WEEK = 7 * 24 * 60 * 60;
+
+async function ff(sec) {
+  await ethers.provider.send("evm_increaseTime", [sec]);
+  await ethers.provider.send("evm_mine", []);
+}
 
 describe("GaugeController @spec", () => {
-  it("INV-GC-04: only owner can add/remove gauges", async () => {
-    const [owner, other] = await ethers.getSigners();
+  let owner, user, other, ve, usage, gc, g0, g1, g2;
 
-    const Ve = await ethers.getContractFactory("contracts/mocks/MockVeBalance.sol:MockVeBalance");
-    const ve = await Ve.deploy(); await ve.waitForDeployment();
+  beforeEach(async () => {
+    [owner, user, other] = await ethers.getSigners();
 
-    const GC = await ethers.getContractFactory("GaugeController");
-    const gc = await GC.deploy(ve.target, owner.address); await gc.waitForDeployment();
+    const Ve = await ethers.getContractFactory("contracts/mocks/MockVeVotes.sol:MockVeVotes");
+    ve = await Ve.deploy();
+    await ve.waitForDeployment();
 
-    const g = ethers.Wallet.createRandom().address;
-
-    // non-owner cannot add/remove
-    await expect(gc.connect(other).addGauge(g)).to.be.reverted;
-    await expect(gc.connect(other).removeGauge(g)).to.be.reverted;
-
-    // owner can add
-    await expect(gc.addGauge(g)).to.emit(gc, "GaugeAdded").withArgs(g);
-
-    // owner can remove
-    await expect(gc.removeGauge(g)).to.emit(gc, "GaugeRemoved").withArgs(g);
-  });
-
-  it("INV-GC-01/02/03: vote respects caps, cooldown and accounting", async () => {
-    const [owner, user] = await ethers.getSigners();
-
-    // mock ve with positive balance for user
-    const Ve = await ethers.getContractFactory("contracts/mocks/MockVeBalance.sol:MockVeBalance");
-    const ve = await Ve.deploy(); await ve.waitForDeployment();
-    await ve.setBalance(user.address, 1); // any positive ve balance
+    const Usage = await ethers.getContractFactory("contracts/mocks/MockUsageMultiplier.sol:MockUsageMultiplier");
+    usage = await Usage.deploy();
+    await usage.waitForDeployment();
 
     const GC = await ethers.getContractFactory("GaugeController");
-    const gc = await GC.deploy(ve.target, owner.address); await gc.waitForDeployment();
+    gc = await GC.deploy(ve.target, usage.target, owner.address);
+    await gc.waitForDeployment();
 
-    // set up two gauges
-    const g0 = ethers.Wallet.createRandom().address;
-    const g1 = ethers.Wallet.createRandom().address;
+    g0 = ethers.Wallet.createRandom().address;
+    g1 = ethers.Wallet.createRandom().address;
+    g2 = ethers.Wallet.createRandom().address;
+
     await gc.addGauge(g0);
     await gc.addGauge(g1);
+    await gc.addGauge(g2);
 
-    // First vote to g0 = 6000 bps (OK)
-    await expect(gc.connect(user).vote_for_gauge_weights(g0, 6000)).to.not.be.reverted;
+    await ve.setBalance(user.address, E("1000"));
+  });
 
-    // Cooldown: immediate re-vote on same gauge should revert
-    await expect(gc.connect(user).vote_for_gauge_weights(g0, 6000)).to.be.revertedWith("cooldown");
+  it("INV-GC-01/05: only owner manages gauges; removed gauge stays historical but inactive", async () => {
+    const ghost = ethers.Wallet.createRandom().address;
+    await expect(gc.connect(other).addGauge(ghost)).to.be.reverted;
+    await expect(gc.connect(other).removeGauge(g0)).to.be.reverted;
 
-    // Pass cooldown, then vote on g1 = 4000 bps (total=10000 OK)
-    await timeTravel(7 * 24 * 3600 + 1);
-    await expect(gc.connect(user).vote_for_gauge_weights(g1, 4000)).to.not.be.reverted;
+    await gc.removeGauge(g0);
+    expect(await gc.isGauge(g0)).to.equal(false);
 
-    // Sum bound: attempting to set g0 to 7001 (sum 7001 + 4000 = 11001) must revert
-    await timeTravel(7 * 24 * 3600 + 1);
-    await expect(gc.connect(user).vote_for_gauge_weights(g0, 7001)).to.be.revertedWith("sum>100%");
+    const first = await gc.gaugesAt(0);
+    expect(first).to.equal(g0);
+  });
 
-    // Accounting: userUsedBps reflects current allocations (6000 + 4000)
-    expect(await gc.userUsedBps(user.address)).to.equal(10000n);
+  it("INV-GC-03/04: vote respects 100%, cooldown, and reset is blocked in closed window", async () => {
+    await gc.setParams(E("250"), 10, 3600);
 
-    // Clear g1 vote → userUsedBps drops to 6000
-    await expect(gc.connect(user).clear_vote(g1)).to.not.be.reverted;
-    expect(await gc.userUsedBps(user.address)).to.equal(6000n);
+    await expect(gc.connect(user).vote([g0, g1], [6000, 4000]))
+      .to.emit(gc, "Voted");
+
+    const ep = await gc.epoch();
+    expect(await gc.userUsedBps(ep, user.address)).to.equal(10000n);
+
+    await expect(gc.connect(user).vote([g0], [5000])).to.be.reverted;
+
+    await ff(3601);
+    await expect(gc.connect(user).vote([g0], [7000])).to.emit(gc, "Voted");
+    expect(await gc.userUsedBps(ep, user.address)).to.equal(7000n);
+
+    await gc.setVoteWindowEndBuffer(3600);
+    const block = await ethers.provider.getBlock("latest");
+    const curEp = Number(await gc.epoch());
+    const epochEnd = (curEp + 1) * WEEK;
+    const delta = epochEnd - block.timestamp - 3599;
+    if (delta > 0) await ff(delta);
+
+    await expect(gc.connect(user).reset()).to.be.revertedWith("vote window closed");
+    await expect(gc.connect(user).vote([g1], [1000])).to.be.revertedWith("vote window closed");
+  });
+
+  it("INV-GC-02/06: finalization copies weights and total from historical gauges", async () => {
+    // Make this deterministic: no end-window restriction during setup vote
+    await gc.setVoteWindowEndBuffer(0);
+
+    await gc.connect(user).vote([g0, g1], [5500, 4500]);
+    const ep = await gc.epoch();
+
+    await gc.removeGauge(g1);
+
+    await ff(WEEK + 2);
+    await expect(gc.finalizeEpoch(ep)).to.emit(gc, "EpochFinalized");
+
+    expect(await gc.gaugeWeightFinal(ep, g0)).to.equal(await gc.gaugeWeightAt(ep, g0));
+    expect(await gc.gaugeWeightFinal(ep, g1)).to.equal(await gc.gaugeWeightAt(ep, g1));
+
+    const total =
+      (await gc.gaugeWeightFinal(ep, g0)) +
+      (await gc.gaugeWeightFinal(ep, g1)) +
+      (await gc.gaugeWeightFinal(ep, g2));
+
+    expect(await gc.totalWeightFinal(ep)).to.equal(total);
   });
 });

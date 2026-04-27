@@ -7,7 +7,7 @@ Licensor:             Paragon Lab
 Licensed Work:        Paragon Protocol Core Contracts
 The Licensed Work is (c) 2025 Paragon Lab
 Additional Use Grant: You may use this software to develop and deploy applications that interact with public deployments of smart contracts compiled from this software (e.g., Ethereum mainnet, Polygon, etc.).
-Change Date:          October 17, 2026
+Change Date:          April 20, 2027
 Change License:       GNU General Public License v2.0 or later
 
 Terms

@@ -1,38 +1,69 @@
 # GaugeController — SPEC
 
-**Intent:** Aggregate veXPGN votes into per-gauge weights per epoch; expose total weight and caps for the Emitter.
+**Intent:**  
+Aggregate veXPGN voting power into per-gauge weights for each epoch, then **finalize immutable epoch snapshots** used by emissions distribution.
 
 ## State
-- `gauges[]` — registered gauges
-- `weight[gauge]` — current bps weight
-- `totalWeight` — sum of all gauge weights (bps)
-- `weightCapBps[gauge]` — optional per-gauge cap
-- `epochLength` / `currentEpoch` — discrete periods for weight updates
-- `ve` — VoterEscrow reference
+- `ve` — `VoterEscrow` voting power source
+- `usage` — usage multiplier / decay source
+- `gauges[]` — historical gauge registry
+- `isGauge[gauge]` — currently active gauge
+- `wasEverGauge[gauge]` — whether a gauge has ever existed
+- `gaugeWeight[epoch][gauge]` — live epoch weight
+- `totalWeight[epoch]` — live epoch total
+- `finalizedGaugeWeight[epoch][gauge]` — frozen epoch weight
+- `finalizedTotalWeight[epoch]` — frozen epoch total
+- `epochFinalized[epoch]`
+- `userVoteBps[epoch][user][gauge]`
+- `userUsedBps[epoch][user]`
+- `userVotedGauges[epoch][user]`
+- `powerUsedAtVote[epoch][user]`
+- `userLastVoteTs[epoch][user]`
+- params:
+  - `minVeToVote`
+  - `maxGaugesPerVote`
+  - `voteCooldown`
+  - `voteWindowEndBuffer`
 
 ## Invariants
-- **INV-GC-01 (Sum bound):** `totalWeight ≤ 10000 bps`.
-- **INV-GC-02 (Per-gauge cap):** `weight[gauge] ≤ weightCapBps[gauge]` if set.
-- **INV-GC-03 (Epoch monotonic):** Epoch can only advance forward; no double-advance in a single block.
-- **INV-GC-04 (Authorized changes):** Only DAO/Admin can add gauges, set caps, or finalize epoch weights.
+- **INV-GC-01 (Historical registry preserved):** Removed gauges are deactivated via `isGauge=false` but remain in `gauges[]` for historical epoch finalization.
+- **INV-GC-02 (Epoch-local finalization):** `finalizedTotalWeight[ep]` equals the sum of copied `finalizedGaugeWeight[ep][g]` values, not stale live totals.
+- **INV-GC-03 (Vote window closure):** `vote()` and external `reset()` cannot change weights during the final closed window before epoch end.
+- **INV-GC-04 (Per-user bps bound):** User vote bps across gauges never exceeds `MAX_BPS`.
+- **INV-GC-05 (Active gauges only for voting):** Only currently active gauges may receive new votes.
+- **INV-GC-06 (Closed epochs only finalized):** `finalizeEpoch(ep)` requires `ep < currentEpoch`.
 
 ## Permissions
-- **DAO/Admin:** `addGauge`, `removeGauge`, `setWeightCap`, `rollEpoch`
-- **Voters (if supported):** vote/adjust weights via veXPGN rules
+- **DAO/Admin:** `addGauge`, `removeGauge`, `setParams`, `setVoteWindowEndBuffer`, `pause`, `unpause`
+- **Users:** `vote`, `reset`
+- **Anyone/Ops bot:** `finalizeEpoch`, `batchFinalize`
 
 ## External Interactions
-- Reads veXPGN balances if voting is dynamic; consumed by GaugeEmitter
+- Reads `ve.balanceOf(user)`
+- Reads and applies `usage.multiplierBps(user)` and `usage.applyDecay(user)`
 
 ## Failure Modes
-- Revert on duplicate gauge, exceeding caps, or invalid epoch ops
+- Revert on:
+  - duplicate gauges in a vote
+  - vote after close window
+  - total bps above 100%
+  - inactive or unknown gauge
+  - finalizing current or future epoch
+  - finalizing empty epoch
 
 ## Events
-- `GaugeAdded(gauge)`, `GaugeRemoved(gauge)`
-- `WeightSet(gauge, bps)`, `WeightCapSet(gauge, capBps)`
-- `EpochRolled(epoch, totalWeight)`
+- `GaugeAdded(gauge)`
+- `GaugeRemoved(gauge)`
+- `Voted(user, epoch, userPowerCached, gauges, bps)`
+- `Reset(user, epoch, userPowerCleared)`
+- `ParamsUpdated(minVeToVote, maxGaugesPerVote, voteCooldown)`
+- `VoteWindowEndBufferUpdated(bufferSeconds)`
+- `EpochFinalized(epoch, totalWeightFinalized)`
 
 ## Tests Map
-- **INV-GC-01:** `test/DAO.t.sol::testWeightSumBound()`
-- **INV-GC-02:** `test/DAO.t.sol::testPerGaugeCap()`
-- **INV-GC-03:** `test/DAO.t.sol::testEpochMonotonic()`
-- **INV-GC-04:** `test/DAO.t.sol::testOnlyDaoCanConfigure()`
+- **INV-GC-01:** `test/GaugeController.t.sol::testRemovedGaugeStillFinalizesHistorically()`
+- **INV-GC-02:** `test/GaugeController.t.sol::testFinalizedTotalEqualsCopiedWeights()`
+- **INV-GC-03:** `test/GaugeController.t.sol::testVoteAndResetBlockedInClosedWindow()`
+- **INV-GC-04:** `test/GaugeController.t.sol::testUserVoteCannotExceed100Percent()`
+- **INV-GC-05:** `test/GaugeController.t.sol::testCannotVoteInactiveGauge()`
+- **INV-GC-06:** `test/GaugeController.t.sol::testFinalizeClosedEpochOnly()`

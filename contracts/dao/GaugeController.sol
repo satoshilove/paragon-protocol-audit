@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -13,9 +13,6 @@ interface IUsageMultiplier {
     function applyDecay(address user) external;
 }
 
-/// @title GaugeController
-/// @notice veXPGN voting controller with live voting during epoch and finalized snapshots for emission distribution
-/// @dev Production-hardened: finalized previous-epoch weights prevent vote sniping on distribution
 contract GaugeController is Ownable, Pausable {
     IVoterEscrowVotes public immutable ve;
     IUsageMultiplier public immutable usage;
@@ -27,15 +24,15 @@ contract GaugeController is Ownable, Pausable {
     uint256 public minVeToVote = 250e18;
     uint256 public maxGaugesPerVote = 10;
     uint256 public voteCooldown = 0;
+    uint256 public voteWindowEndBuffer = 1 hours;
 
     address[] public gauges;
     mapping(address => bool) public isGauge;
+    mapping(address => bool) public wasEverGauge;
 
-    // live weights (modifiable during current epoch)
     mapping(uint256 => mapping(address => uint256)) public gaugeWeight;
     mapping(uint256 => uint256) public totalWeight;
 
-    // finalized snapshot (immutable after epoch close)
     mapping(uint256 => bool) public epochFinalized;
     mapping(uint256 => mapping(address => uint256)) public finalizedGaugeWeight;
     mapping(uint256 => uint256) public finalizedTotalWeight;
@@ -51,6 +48,7 @@ contract GaugeController is Ownable, Pausable {
     event Voted(address indexed user, uint256 indexed epoch, uint256 userPowerCached, address[] gauges, uint256[] bps);
     event Reset(address indexed user, uint256 indexed epoch, uint256 userPowerCleared);
     event ParamsUpdated(uint256 minVeToVote, uint256 maxGaugesPerVote, uint256 voteCooldown);
+    event VoteWindowEndBufferUpdated(uint256 bufferSeconds);
     event EpochFinalized(uint256 indexed ep, uint256 totalWeightFinalized);
 
     constructor(address _ve, address _usage, address initialOwner) Ownable(initialOwner) {
@@ -62,6 +60,19 @@ contract GaugeController is Ownable, Pausable {
 
     function epoch() public view returns (uint256) {
         return block.timestamp / WEEK;
+    }
+
+    function epochStart(uint256 ep) public pure returns (uint256) {
+        return ep * WEEK;
+    }
+
+    function epochEnd(uint256 ep) public pure returns (uint256) {
+        return (ep + 1) * WEEK;
+    }
+
+    function _voteWindowOpen(uint256 ep) internal view returns (bool) {
+        if (voteWindowEndBuffer == 0) return true;
+        return block.timestamp + voteWindowEndBuffer < epochEnd(ep);
     }
 
     function setParams(uint256 _minVeToVote, uint256 _maxGaugesPerVote, uint256 _voteCooldown)
@@ -78,28 +89,29 @@ contract GaugeController is Ownable, Pausable {
         emit ParamsUpdated(_minVeToVote, _maxGaugesPerVote, _voteCooldown);
     }
 
+    function setVoteWindowEndBuffer(uint256 bufferSeconds) external onlyOwner {
+        require(bufferSeconds <= 2 days, "buffer too large");
+        voteWindowEndBuffer = bufferSeconds;
+        emit VoteWindowEndBufferUpdated(bufferSeconds);
+    }
+
     function addGauge(address gauge) external onlyOwner {
         require(gauge != address(0), "gauge=0");
-        require(!isGauge[gauge], "gauge already exists");
-        require(gauges.length < MAX_GAUGES, "max gauges reached");
+        require(!isGauge[gauge], "gauge already active");
+
+        if (!wasEverGauge[gauge]) {
+            require(gauges.length < MAX_GAUGES, "max gauges reached");
+            gauges.push(gauge);
+            wasEverGauge[gauge] = true;
+        }
+
         isGauge[gauge] = true;
-        gauges.push(gauge);
         emit GaugeAdded(gauge);
     }
 
     function removeGauge(address gauge) external onlyOwner {
         require(isGauge[gauge], "gauge does not exist");
         isGauge[gauge] = false;
-
-        uint256 L = gauges.length;
-        for (uint256 i = 0; i < L; ++i) {
-            if (gauges[i] == gauge) {
-                gauges[i] = gauges[L - 1];
-                gauges.pop();
-                break;
-            }
-        }
-
         emit GaugeRemoved(gauge);
     }
 
@@ -128,7 +140,10 @@ contract GaugeController is Ownable, Pausable {
     }
 
     function reset() external whenNotPaused {
-        _resetFor(epoch(), msg.sender);
+        uint256 ep = epoch();
+        require(!epochFinalized[ep], "current epoch already finalized");
+        require(_voteWindowOpen(ep), "vote window closed");
+        _resetFor(ep, msg.sender);
     }
 
     function vote(address[] calldata _gauges, uint256[] calldata _bps) external whenNotPaused {
@@ -138,6 +153,7 @@ contract GaugeController is Ownable, Pausable {
 
         uint256 ep = epoch();
         require(!epochFinalized[ep], "current epoch already finalized");
+        require(_voteWindowOpen(ep), "vote window closed");
 
         if (voteCooldown > 0) {
             require(block.timestamp >= userLastVoteTs[ep][msg.sender] + voteCooldown, "vote cooldown active");
@@ -198,21 +214,24 @@ contract GaugeController is Ownable, Pausable {
         require(ep < epoch(), "epoch not yet closed");
         require(!epochFinalized[ep], "epoch already finalized");
 
-        uint256 tw = totalWeight[ep];
-        require(tw > 0, "no total weight");
-
-        finalizedTotalWeight[ep] = tw;
-
         uint256 n = gauges.length;
+        uint256 copiedTotal;
+
         for (uint256 i = 0; i < n; ++i) {
             address g = gauges[i];
-            if (isGauge[g]) {
-                finalizedGaugeWeight[ep][g] = gaugeWeight[ep][g];
-            }
+            uint256 gw = gaugeWeight[ep][g];
+            if (gw == 0) continue;
+
+            finalizedGaugeWeight[ep][g] = gw;
+            copiedTotal += gw;
         }
 
+        require(copiedTotal > 0, "no total weight");
+
+        finalizedTotalWeight[ep] = copiedTotal;
         epochFinalized[ep] = true;
-        emit EpochFinalized(ep, tw);
+
+        emit EpochFinalized(ep, copiedTotal);
     }
 
     function gaugeWeightAt(uint256 ep, address gauge) external view returns (uint256) {

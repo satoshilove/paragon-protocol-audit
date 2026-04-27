@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity ^0.8.27;
 
-import "./P10IndexManager.sol";
+import "./interfaces/IP10IndexManager.sol";
+import "./interfaces/IP10Token.sol";
 
-/**
- * @title P10View
- * @notice Read-only helper for frontends / analytics.
- * @dev Does NOT hold funds, does NOT have any permissions.
- */
 contract P10View {
-    P10IndexManager public immutable manager;
-    P10Token public immutable p10;
+    IP10IndexManager public immutable manager;
+    IP10Token public immutable p10;
 
     struct P10Config {
         uint256 snapshotId;
@@ -24,11 +20,15 @@ contract P10View {
         address feeRecipient;
         address pauser;
         address guardian;
+        address vault;
+        address executionManager;
+        address mintVenue;
+        address redeemVenue;
     }
 
     constructor(address _manager, address _p10) {
-        manager = P10IndexManager(_manager);
-        p10 = P10Token(_p10);
+        manager = IP10IndexManager(_manager);
+        p10 = IP10Token(_p10);
     }
 
     function getConfig() external view returns (P10Config memory cfg) {
@@ -43,6 +43,10 @@ contract P10View {
         cfg.feeRecipient = manager.feeRecipient();
         cfg.pauser = manager.pauser();
         cfg.guardian = manager.guardian();
+        cfg.vault = address(manager.vault());
+        cfg.executionManager = address(manager.executionManager());
+        cfg.mintVenue = manager.mintVenue();
+        cfg.redeemVenue = manager.redeemVenue();
     }
 
     function navAndSupply() external view returns (uint256 navE18, uint256 totalSupply) {

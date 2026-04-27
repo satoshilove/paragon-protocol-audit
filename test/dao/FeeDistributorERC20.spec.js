@@ -15,87 +15,77 @@ async function latestTs() {
 }
 async function toNextWeek() {
   const ts = await latestTs();
-  const delta = WEEK - (ts % WEEK) + 1; // +1s nudge past the boundary
+  const delta = WEEK - (ts % WEEK) + 1;
   await ff(delta);
 }
-async function tryCall(c, fn, ...args) {
-  if (typeof c[fn] === "function") {
-    const tx = await c[fn](...args);
-    await tx.wait();
-    return true;
-  }
-  return false;
+function absDiff(a, b) {
+  return a > b ? a - b : b - a;
 }
 
 describe("FeeDistributorERC20 @spec", () => {
-  it("INV-FD-01/02: notify snapshots ve supply; single-lock user gets ~full amount on claim (≤2e13 wei drift ok)", async () => {
+  it("INV-FD-02/04: notify uses actual received amount and a single locker gets ~full funded week reward", async () => {
     const [owner, user] = await ethers.getSigners();
 
-    // Token
     const ERC = await ethers.getContractFactory("contracts/mocks/MockERC20.sol:MockERC20");
     const X = await ERC.deploy("XPGN", "XPGN", 18);
     await X.waitForDeployment();
 
-    // VoterEscrow (real)
     const VE = await ethers.getContractFactory("VoterEscrow");
     const ve = await VE.deploy(X.target, owner.address);
     await ve.waitForDeployment();
 
-    // Fee distributor
     const FD = await ethers.getContractFactory("FeeDistributorERC20");
     const fd = await FD.deploy(X.target, ve.target, owner.address);
     await fd.waitForDeployment();
 
-    // --- IMPORTANT ORDER ---
-    // 1) Nudge time a little to avoid exact boundary
-    await ff(2);
+    await fd.setRewardNotifier(owner.address, true);
 
-    // Nudge close to the end of the current week to minimize time between lock creation and epoch snapshot
-    let ts = await latestTs();
-    let mod = ts % WEEK;
-    const nudge = WEEK - mod - 1;
-    await ff(nudge);
-
-    // 2) Create a healthy multi-week lock BEFORE any epoch alignment
+    // Create lock FIRST, then move forward enough weeks so the first-claim lookback
+    // window is fully after lock creation.
     await X.mint(user.address, E("100"));
     await X.connect(user).approve(ve.target, ethers.MaxUint256);
 
-    // Make the unlock far enough in the future so any snapshot week we touch is < end.
-    const unlock = (await latestTs()) + 8 * WEEK;
-    await expect(ve.connect(user).create_lock(E("100"), unlock)).to.emit(ve, "LockCreated");
+    const unlock = (await latestTs()) + 40 * WEEK;
+    await ve.connect(user).create_lock(E("100"), unlock);
 
-    // Optional checkpoints (no-op if function not present)
-    await tryCall(ve, "checkpoint");
-    await tryCall(fd, "checkpointTotalSupply");
-    await tryCall(fd, "checkpointUser", user.address);
+    // Move forward 12+ weeks so the first-claim window is safe to finalize contiguously
+    for (let i = 0; i < 13; i++) {
+      await toNextWeek();
+    }
 
-    // 3) Move to the start of the NEXT epoch and notify rewards
-    await toNextWeek();
+    // Fund one target week
+    const fundedWeek = BigInt(Math.floor((await latestTs()) / WEEK) * WEEK);
+
     await X.mint(owner.address, E("50"));
     await X.connect(owner).approve(fd.target, E("50"));
-    await expect(fd.connect(owner).notifyRewardAmount(E("50"))).to.emit(fd, "Notified");
+    await expect(fd.notifyRewardAmount(E("50"))).to.emit(fd, "RewardNotified");
 
-    // Take snapshots for funded epoch (defensive)
-    await tryCall(fd, "checkpointTotalSupply");
-    await tryCall(fd, "checkpointUser", user.address);
+    expect(await fd.epochRewards(fundedWeek)).to.equal(E("50"));
 
-    // 4) After that epoch completes, user should receive ~all the reward
+    // Move into the next week so fundedWeek is closed
     await toNextWeek();
+
+    // Finalize the exact 12-week initial claim window ending at fundedWeek
+    const weeks = [];
+    for (let i = 11n; i >= 0n; i--) {
+      weeks.push(fundedWeek - i * BigInt(WEEK));
+    }
+    await fd.batchFinalize(weeks);
 
     const b0 = await X.balanceOf(user.address);
     await expect(fd.connect(user).claim(user.address)).to.emit(fd, "Claimed");
     const b1 = await X.balanceOf(user.address);
 
     const got = b1 - b0;
-    const notified = E("50");
-    const drift = got > notified ? got - notified : notified - got;
+    expect(got).to.be.gt(0n);
 
-    // Allow small rounding drift from weekly bucketting + linear ve decay
-    const MAX_DRIFT = 20_000_000_000_000n; // 2e13 wei
-    expect(drift).to.lte(MAX_DRIFT);
+    // Since user is the only locker, fundedWeek should contribute almost all 50 tokens.
+    // Earlier finalized weeks had zero rewards.
+    const drift = absDiff(got, E("50"));
+    expect(drift).to.lte(20_000_000_000_000n);
   });
 
-  it("INV-FD-03: pause/unpause gates claim/notify", async () => {
+  it("INV-FD-03/05: cannot finalize open week; unfinalized later week is not claimable yet", async () => {
     const [owner, user] = await ethers.getSigners();
 
     const ERC = await ethers.getContractFactory("contracts/mocks/MockERC20.sol:MockERC20");
@@ -110,15 +100,91 @@ describe("FeeDistributorERC20 @spec", () => {
     const fd = await FD.deploy(X.target, ve.target, owner.address);
     await fd.waitForDeployment();
 
-    await fd.pause();
-    await expect(fd.connect(user).claim(user.address)).to.be.reverted;
-    await fd.unpause();
+    await fd.setRewardNotifier(owner.address, true);
 
-    // also verify notify is gated by pause
+    await X.mint(user.address, E("100"));
+    await X.connect(user).approve(ve.target, ethers.MaxUint256);
+
+    const unlock = (await latestTs()) + 40 * WEEK;
+    await ve.connect(user).create_lock(E("100"), unlock);
+
+    // Again move forward 12+ weeks to make the first-claim window safe
+    for (let i = 0; i < 13; i++) {
+      await toNextWeek();
+    }
+
+    // Fund week 1
+    const week1 = BigInt(Math.floor((await latestTs()) / WEEK) * WEEK);
+
+    await X.mint(owner.address, E("10"));
+    await X.connect(owner).approve(fd.target, E("20"));
+    await fd.notifyRewardAmount(E("10"));
+
+    // Cannot finalize open week
+    await expect(fd.finalizeEpoch(week1)).to.be.reverted;
+
+    // Move forward, now week1 is closed
+    await toNextWeek();
+    await fd.finalizeEpoch(week1);
+
+    // Fund week 2, but don't finalize it yet
+    const week2 = BigInt(Math.floor((await latestTs()) / WEEK) * WEEK);
+    await X.mint(owner.address, E("10"));
+    await fd.notifyRewardAmount(E("10"));
+
+    // Move one more week forward so week2 is closed but still unfinalized
+    await toNextWeek();
+
+    // Finalize all earlier weeks in the first-claim window EXCEPT week2
+    const olderWeeks = [];
+    for (let i = 11n; i >= 1n; i--) {
+      olderWeeks.push(week2 - i * BigInt(WEEK));
+    }
+    await fd.batchFinalize(olderWeeks);
+
+    const before = await X.balanceOf(user.address);
+    await fd.connect(user).claim(user.address);
+    const after = await X.balanceOf(user.address);
+
+    const received = after - before;
+
+    // User should have received week1 rewards only, not both funded weeks.
+    expect(received).to.be.gt(0n);
+    expect(received).to.be.lt(E("20"));
+
+    // Now finalize week2 and claim again; second claim should add more
+    await fd.finalizeEpoch(week2);
+
+    const before2 = await X.balanceOf(user.address);
+    await fd.connect(user).claim(user.address);
+    const after2 = await X.balanceOf(user.address);
+
+    expect(after2 - before2).to.be.gt(0n);
+  });
+
+  it("INV-FD-06 + pause gates notify/claim", async () => {
+    const [owner, user] = await ethers.getSigners();
+
+    const ERC = await ethers.getContractFactory("contracts/mocks/MockERC20.sol:MockERC20");
+    const X = await ERC.deploy("XPGN", "XPGN", 18);
+    await X.waitForDeployment();
+
+    const VE = await ethers.getContractFactory("VoterEscrow");
+    const ve = await VE.deploy(X.target, owner.address);
+    await ve.waitForDeployment();
+
+    const FD = await ethers.getContractFactory("FeeDistributorERC20");
+    const fd = await FD.deploy(X.target, ve.target, owner.address);
+    await fd.waitForDeployment();
+
+    await fd.setRewardNotifier(owner.address, true);
+
     await fd.pause();
+
     await X.mint(owner.address, E("1"));
     await X.connect(owner).approve(fd.target, E("1"));
-    await expect(fd.connect(owner).notifyRewardAmount(E("1"))).to.be.reverted;
-    await fd.unpause();
+
+    await expect(fd.notifyRewardAmount(E("1"))).to.be.reverted;
+    await expect(fd.connect(user).claim(user.address)).to.be.reverted;
   });
 });

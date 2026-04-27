@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 
 // Note: SafeMath is not needed in Solidity ^0.8.0 due to built-in overflow protection

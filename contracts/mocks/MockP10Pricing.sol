@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 
-import {IP10Pricing} from "../p10/interfaces/IP10Core.sol";
+import {IP10Pricing} from "../P10/interfaces/IP10Core.sol";
 
 contract MockP10Pricing is IP10Pricing {
     struct PriceData {

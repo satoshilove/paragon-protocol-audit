@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -7,13 +7,6 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title VoterEscrow
-/// @notice Checkpointed ve-style escrow with historical reads.
-/// @dev Production-hardened:
-/// - correct negative slope scheduling
-/// - historical balance/supply reads
-/// - longer checkpoint catch-up bound (520 weeks)
-/// - minimum lock duration enforced at 4 weeks
 contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -34,23 +27,17 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     uint256 public constant WEEK = 7 days;
     uint256 public constant MIN_LOCK_TIME = 4 weeks;
     uint256 public constant MAXTIME = 4 * 365 days;
-    uint256 internal constant MAX_WEEKS_FORWARD = 520; // ~10 years
+    uint256 internal constant MAX_WEEKS_FORWARD = 520;
 
-    // global epoch => point
     uint256 public epoch;
     mapping(uint256 => Point) public pointHistory;
-
-    // future week => delta slope
     mapping(uint256 => int128) public slopeChanges;
 
-    // user => current lock
     mapping(address => LockedBalance) public locked;
-
-    // user => latest user epoch
     mapping(address => uint256) public userPointEpoch;
-
-    // user => epoch => point
     mapping(address => mapping(uint256 => Point)) public userPointHistory;
+
+    mapping(address => bool) public rewardDepositors;
 
     event Deposit(
         address indexed provider,
@@ -63,6 +50,12 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     event Withdraw(address indexed provider, uint256 value, uint256 ts);
     event Supply(uint256 previousSupply, uint256 supply);
     event Checkpoint(uint256 indexed globalEpoch, uint256 ts, int128 bias, int128 slope);
+    event RewardDepositorSet(address indexed depositor, bool allowed);
+
+    modifier onlyRewardDepositor() {
+        require(rewardDepositors[msg.sender], "not reward depositor");
+        _;
+    }
 
     constructor(address _token, address initialOwner) Ownable(initialOwner) {
         require(_token != address(0), "token=0");
@@ -88,6 +81,12 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
         _unpause();
     }
 
+    function setRewardDepositor(address depositor, bool allowed) external onlyOwner {
+        require(depositor != address(0), "depositor=0");
+        rewardDepositors[depositor] = allowed;
+        emit RewardDepositorSet(depositor, allowed);
+    }
+
     // ============================================================
     // Lock creation / management
     // ============================================================
@@ -100,70 +99,38 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
         _createLockFor(msg.sender, amount, unlockTime);
     }
 
+    /// @notice Trusted third-party creation path for protocol lockers/reward systems only.
     function create_lock_for(
         address to,
         uint256 amount,
         uint256 unlockTime
-    ) external whenNotPaused nonReentrant returns (uint256 tokenId) {
+    ) external onlyRewardDepositor whenNotPaused nonReentrant returns (uint256 tokenId) {
         _createLockFor(to, amount, unlockTime);
         return 0;
     }
 
+    /// @notice Trusted third-party creation path for Solidly-style order.
     function create_lock_for(
         uint256 amount,
         uint256 unlockTime,
         address to
-    ) external whenNotPaused nonReentrant returns (uint256 tokenId) {
+    ) external onlyRewardDepositor whenNotPaused nonReentrant returns (uint256 tokenId) {
         _createLockFor(to, amount, unlockTime);
         return 0;
     }
 
-    function _createLockFor(address beneficiary, uint256 amount, uint256 unlockTime) internal {
-        require(beneficiary != address(0), "beneficiary=0");
-        require(amount > 0, "amount=0");
-
-        LockedBalance memory oldLocked = locked[beneficiary];
-        require(oldLocked.amount == 0, "lock exists");
-
-        uint256 end = _roundDownWeek(unlockTime);
-        require(end >= block.timestamp + MIN_LOCK_TIME, "min 4 weeks");
-        require(end <= block.timestamp + MAXTIME, "end>maxtime");
-
-        LockedBalance memory newLocked = LockedBalance({
-            amount: _toInt128(amount),
-            end: end
-        });
-
-        uint256 supplyBefore = XPGN.balanceOf(address(this));
-        locked[beneficiary] = newLocked;
-
-        _checkpoint(beneficiary, oldLocked, newLocked);
-
-        XPGN.safeTransferFrom(msg.sender, address(this), amount);
-
-        emit Deposit(msg.sender, beneficiary, amount, end, 0, block.timestamp);
-        emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
+    function increase_amount(uint256 amount) external whenNotPaused nonReentrant {
+        _increaseAmountFor(msg.sender, msg.sender, amount);
     }
 
-    function increase_amount(uint256 amount) external whenNotPaused nonReentrant {
-        require(amount > 0, "amount=0");
-
-        LockedBalance memory oldLocked = locked[msg.sender];
-        require(oldLocked.amount > 0, "no lock");
-        require(oldLocked.end > block.timestamp, "expired");
-
-        LockedBalance memory newLocked = oldLocked;
-        newLocked.amount += _toInt128(amount);
-
-        uint256 supplyBefore = XPGN.balanceOf(address(this));
-        locked[msg.sender] = newLocked;
-
-        _checkpoint(msg.sender, oldLocked, newLocked);
-
-        XPGN.safeTransferFrom(msg.sender, address(this), amount);
-
-        emit Deposit(msg.sender, msg.sender, amount, newLocked.end, 1, block.timestamp);
-        emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
+    /// @notice Trusted top-up path for protocol reward lockers.
+    function increase_amount_for(address beneficiary, uint256 amount)
+        external
+        whenNotPaused
+        nonReentrant
+        onlyRewardDepositor
+    {
+        _increaseAmountFor(msg.sender, beneficiary, amount);
     }
 
     function increase_unlock_time(uint256 newUnlockTime) external whenNotPaused nonReentrant {
@@ -204,6 +171,55 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     function checkpoint() external {
         LockedBalance memory empty;
         _checkpoint(address(0), empty, empty);
+    }
+
+    function _createLockFor(address beneficiary, uint256 amount, uint256 unlockTime) internal {
+        require(beneficiary != address(0), "beneficiary=0");
+        require(amount > 0, "amount=0");
+
+        LockedBalance memory oldLocked = locked[beneficiary];
+        require(oldLocked.amount == 0, "lock exists");
+
+        uint256 end = _roundDownWeek(unlockTime);
+        require(end >= block.timestamp + MIN_LOCK_TIME, "min 4 weeks");
+        require(end <= block.timestamp + MAXTIME, "end>maxtime");
+
+        LockedBalance memory newLocked = LockedBalance({
+            amount: _toInt128(amount),
+            end: end
+        });
+
+        uint256 supplyBefore = XPGN.balanceOf(address(this));
+        locked[beneficiary] = newLocked;
+
+        _checkpoint(beneficiary, oldLocked, newLocked);
+
+        XPGN.safeTransferFrom(msg.sender, address(this), amount);
+
+        emit Deposit(msg.sender, beneficiary, amount, end, 0, block.timestamp);
+        emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
+    }
+
+    function _increaseAmountFor(address payer, address beneficiary, uint256 amount) internal {
+        require(beneficiary != address(0), "beneficiary=0");
+        require(amount > 0, "amount=0");
+
+        LockedBalance memory oldLocked = locked[beneficiary];
+        require(oldLocked.amount > 0, "no lock");
+        require(oldLocked.end > block.timestamp, "expired");
+
+        LockedBalance memory newLocked = oldLocked;
+        newLocked.amount += _toInt128(amount);
+
+        uint256 supplyBefore = XPGN.balanceOf(address(this));
+        locked[beneficiary] = newLocked;
+
+        _checkpoint(beneficiary, oldLocked, newLocked);
+
+        XPGN.safeTransferFrom(payer, address(this), amount);
+
+        emit Deposit(payer, beneficiary, amount, newLocked.end, 1, block.timestamp);
+        emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
     }
 
     // ============================================================
@@ -329,7 +345,6 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
             lastPoint.slope = int128(slope_);
             pointHistory[_epoch] = lastPoint;
 
-            // old end: cancel previously scheduled negative slope, then re-apply based on new state
             if (oldLocked.end > block.timestamp) {
                 oldDSlope += uOld.slope;
                 if (newLocked.end == oldLocked.end) {
@@ -338,7 +353,6 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
                 slopeChanges[oldLocked.end] = oldDSlope;
             }
 
-            // new end: schedule negative slope at expiry
             if (newLocked.end > block.timestamp && newLocked.end > oldLocked.end) {
                 newDSlope -= uNew.slope;
                 slopeChanges[newLocked.end] = newDSlope;

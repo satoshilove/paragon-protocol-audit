@@ -130,7 +130,9 @@ contract ParagonPayflowExecutorV2 is Ownable, ReentrancyGuard, Pausable {
     uint16 public lpBips = 3000; // 30%
 
     uint16 public relayerFeeBips;
+    uint16 public aggregatorFeeBips;
     uint16 public constant MAX_RELAYER_FEE_BPS = 10; // 10 bps = 0.10%
+    uint16 public constant MAX_AGGREGATOR_FEE_BPS = 100; // 100 bps = 1.00%
 
     uint8 public constant MAX_PATH_LEN = 5;
     uint8 public constant DEFAULT_AUTO_PREF = 0;
@@ -226,6 +228,8 @@ contract ParagonPayflowExecutorV2 is Ownable, ReentrancyGuard, Pausable {
 
     event SplitUpdated(uint16 traderBips, uint16 lpBips, uint16 lockerBips);
     event RelayerFeeUpdated(uint16 bps);
+    event AggregatorFeeUpdated(uint16 bps);
+    event AggregatorFeeTaken(address indexed tokenOut, uint256 amount);
     event RelayerPaid(address indexed relayer, uint256 amount);
     event ParamsUpdated(
         address router,
@@ -260,6 +264,7 @@ contract ParagonPayflowExecutorV2 is Ownable, ReentrancyGuard, Pausable {
         lockerVault = _lockerVault;
         protocolFeeBips = 0;
         relayerFeeBips = 0;
+        aggregatorFeeBips = 0;
 
         venueEnabled[_router] = true;
         emit VenueToggled(_router, true);
@@ -340,6 +345,12 @@ contract ParagonPayflowExecutorV2 is Ownable, ReentrancyGuard, Pausable {
         if (bps > MAX_RELAYER_FEE_BPS) revert BadSplit();
         relayerFeeBips = bps;
         emit RelayerFeeUpdated(bps);
+    }
+
+    function setAggregatorFeeBips(uint16 bps) external onlyOwner {
+        if (bps > MAX_AGGREGATOR_FEE_BPS) revert BadSplit();
+        aggregatorFeeBips = bps;
+        emit AggregatorFeeUpdated(bps);
     }
 
     function _checkSplit() internal view {
@@ -535,13 +546,21 @@ contract ParagonPayflowExecutorV2 is Ownable, ReentrancyGuard, Pausable {
             executor
         );
 
-        if (received < it.minAmountOut) revert RouterSwapFailed();
+        uint256 aggregatorFee = aggregatorFeeBips > 0 ? (received * aggregatorFeeBips) / 10_000 : 0;
+        uint256 settleAmount = received - aggregatorFee;
+
+        if (settleAmount < it.minAmountOut) revert RouterSwapFailed();
+
+        if (aggregatorFee > 0 && daoVault != address(0)) {
+            IERC20(it.tokenOut).safeTransfer(daoVault, aggregatorFee);
+            emit AggregatorFeeTaken(it.tokenOut, aggregatorFee);
+        }
 
         address[] memory route = new address[](2);
         route[0] = it.tokenIn;
         route[1] = it.tokenOut;
 
-        _splitAndSettle(it, route, received, new uint16[](0));
+        _splitAndSettle(it, route, settleAmount, new uint16[](0));
     }
 
     // --- internal: split + settle ---

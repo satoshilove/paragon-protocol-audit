@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.25;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -13,7 +13,6 @@ interface IGaugeControllerFinal {
     function gaugesAt(uint256 i) external view returns (address);
     function totalWeightFinal(uint256 ep) external view returns (uint256);
     function gaugeWeightFinal(uint256 ep, address gauge) external view returns (uint256);
-    function isGauge(address gauge) external view returns (bool);
     function epoch() external view returns (uint256);
     function epochFinalized(uint256 ep) external view returns (bool);
 }
@@ -26,8 +25,6 @@ interface IFarmGaugeNotify {
     function notifyGaugeReward(uint256 pid, uint256 amount) external;
 }
 
-/// @title UnifiedEmissionsDistributor
-/// @notice Single weekly distributor using finalized gauge weights for both SimpleGauge and ParagonFarmController
 contract UnifiedEmissionsDistributor is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -52,7 +49,13 @@ contract UnifiedEmissionsDistributor is Ownable, Pausable, ReentrancyGuard {
     event FarmUpdated(address indexed farm);
     event ControllerUpdated(address indexed controller);
     event GaugeMapped(address indexed gauge, uint256 pid, bool isSimple);
-    event EmissionsPushed(uint256 indexed weekTs, uint256 indexed sourceEpoch, uint256 totalAllocated, uint256 gaugesUsed);
+    event EmissionsPushed(
+        uint256 indexed weekTs,
+        uint256 indexed sourceEpoch,
+        uint256 totalAllocated,
+        uint256 gaugesUsed,
+        uint256 dustRemainder
+    );
     event EmergencyWithdraw(address indexed tokenAddr, address indexed to, uint256 amount);
 
     constructor(address _token, address _controller, address _farm, address initialOwner)
@@ -89,13 +92,12 @@ contract UnifiedEmissionsDistributor is Ownable, Pausable, ReentrancyGuard {
     }
 
     function mapGauge(address gauge, uint256 pid, bool simple) external onlyOwner {
-        require(controller.isGauge(gauge), "not a registered gauge");
-
         if (simple) {
             isSimpleGauge[gauge] = true;
             isFarmGauge[gauge] = false;
             gaugeToPid[gauge] = 0;
         } else {
+            require(farm != address(0), "farm=0");
             isSimpleGauge[gauge] = false;
             isFarmGauge[gauge] = true;
             gaugeToPid[gauge] = pid;
@@ -120,20 +122,23 @@ contract UnifiedEmissionsDistributor is Ownable, Pausable, ReentrancyGuard {
         require(tw > 0, "no total weight");
 
         uint256 n = controller.n_gauges();
-        require(n > 0, "no gauges registered");
+        require(n > 0, "no gauges known");
 
         address[] memory targets = new address[](n);
         uint256[] memory amts = new uint256[](n);
+
         uint256 realCount;
         uint256 allocated;
+        uint256 farmTotal;
 
         for (uint256 i = 0; i < n; ++i) {
             address g = controller.gaugesAt(i);
-            if (!controller.isGauge(g)) continue;
-
             uint256 gw = controller.gaugeWeightFinal(sourceEp, g);
             if (gw == 0) continue;
-            if (!isSimpleGauge[g] && !isFarmGauge[g]) continue;
+
+            bool simple = isSimpleGauge[g];
+            bool farmGauge = isFarmGauge[g];
+            require(simple || farmGauge, "unmapped weighted gauge");
 
             uint256 amt = (weeklyEmission * gw) / tw;
             if (amt == 0) continue;
@@ -141,25 +146,32 @@ contract UnifiedEmissionsDistributor is Ownable, Pausable, ReentrancyGuard {
             targets[realCount] = g;
             amts[realCount] = amt;
             allocated += amt;
+
+            if (farmGauge) {
+                farmTotal += amt;
+            }
+
             realCount++;
         }
 
         require(realCount > 0, "nothing to allocate");
+        require(allocated > 0, "allocated=0");
 
-        // lock the week before any external interactions
         lastPushedWeek = weekTs;
 
-        // fund first
         if (useMinting) {
-            IMintable(address(token)).mint(address(this), weeklyEmission);
+            IMintable(address(token)).mint(address(this), allocated);
         } else {
-            token.safeTransferFrom(treasury, address(this), weeklyEmission);
+            uint256 balBefore = token.balanceOf(address(this));
+            token.safeTransferFrom(treasury, address(this), allocated);
+            uint256 received = token.balanceOf(address(this)) - balBefore;
+            require(received == allocated, "bad treasury funding");
         }
 
-        // one-time approval for farm
-        if (farm != address(0)) {
+        if (farmTotal > 0) {
+            require(farm != address(0), "farm=0");
             token.forceApprove(farm, 0);
-            token.forceApprove(farm, weeklyEmission);
+            token.forceApprove(farm, farmTotal);
         }
 
         for (uint256 i = 0; i < realCount; ++i) {
@@ -170,16 +182,23 @@ contract UnifiedEmissionsDistributor is Ownable, Pausable, ReentrancyGuard {
                 token.forceApprove(g, 0);
                 token.forceApprove(g, amt);
                 ISimpleGauge(g).notifyRewardAmount(amt);
-            } else if (isFarmGauge[g]) {
+                token.forceApprove(g, 0);
+            } else {
                 IFarmGaugeNotify(farm).notifyGaugeReward(gaugeToPid[g], amt);
             }
         }
 
-        if (farm != address(0)) {
+        if (farmTotal > 0) {
             token.forceApprove(farm, 0);
         }
 
-        emit EmissionsPushed(weekTs, sourceEp, allocated, realCount);
+        emit EmissionsPushed(
+            weekTs,
+            sourceEp,
+            allocated,
+            realCount,
+            weeklyEmission - allocated
+        );
     }
 
     function pause() external onlyOwner {

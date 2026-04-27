@@ -7,7 +7,14 @@
     "test:verbose": "hardhat test --network bscTestnet --verbose",
     "test:local": "hardhat test --network hardhat",
     "compile": "hardhat compile",
-    "clean": "hardhat clean"
+    "clean": "hardhat clean",
+    "test:dao": "hardhat test test/dao/FeeDistributorERC20.spec.js test/dao/GaugeController.spec.js test/dao/SimpleGauge.spec.js test/dao/TraderRewardsLocker.spec.js test/dao/UsagePoints.spec.js test/dao/VoterEscrow.spec.js test/dao/RevenueRouter.spec.js test/dao/UnifiedEmissionsDistributor.spec.js test/dao/DAOEndToEnd.spec.js test/dao/DeploymentWiring.spec.js test/dao/FeeDistributorERC20.MultiUser.spec.js test/dao/TraderRewardsLocker.Rounding.spec.js test/dao/VoterEscrow.Edge.spec.js test/dao/UnifiedEmissionsDistributor.Failure.spec.js test/dao/DAOInvariants.spec.js --network hardhat",
+    "test:dao:gas": "cross-env REPORT_GAS=true hardhat test test/dao/FeeDistributorERC20.spec.js test/dao/GaugeController.spec.js test/dao/SimpleGauge.spec.js test/dao/TraderRewardsLocker.spec.js test/dao/UsagePoints.spec.js test/dao/VoterEscrow.spec.js test/dao/RevenueRouter.spec.js test/dao/UnifiedEmissionsDistributor.spec.js test/dao/DAOEndToEnd.spec.js test/dao/DeploymentWiring.spec.js test/dao/FeeDistributorERC20.MultiUser.spec.js test/dao/TraderRewardsLocker.Rounding.spec.js test/dao/VoterEscrow.Edge.spec.js test/dao/UnifiedEmissionsDistributor.Failure.spec.js test/dao/DAOInvariants.spec.js --network hardhat",
+    "test:dao:e2e": "hardhat test test/dao/DAOEndToEnd.spec.js test/dao/DeploymentWiring.spec.js --network hardhat",
+    "test:dao:invariants": "hardhat test test/dao/DAOInvariants.spec.js test/dao/FeeDistributorERC20.MultiUser.spec.js --network hardhat",
+    "test:dao:randomized": "hardhat test test/dao/RandomizedVoterEpochs.spec.js test/dao/RandomizedRevenueEpochs.spec.js test/dao/RandomizedGaugeLifecycle.spec.js test/dao/RandomizedTraderRewards.spec.js --network hardhat",
+    "coverage:dao": "cross-env SOLIDITY_COVERAGE=true hardhat coverage --testfiles \"test/dao/**/*.spec.js\"",
+    "coverage:dao:debug": "cross-env SOLIDITY_COVERAGE=true HARDHAT_VERBOSE=true hardhat coverage --testfiles \"test/dao/**/*.spec.js\""
   },
   "keywords": [],
   "author": "",
@@ -23,6 +30,7 @@
     "@types/mocha": "^10.0.10",
     "@types/sinon-chai": "^3.2.3",
     "chai": "^4.5.0",
+    "cross-env": "^7.0.3",
     "dotenv": "^17.2.1",
     "ethereum-waffle": "^4.0.10",
     "ethers": "^6.15.0",
