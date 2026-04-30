@@ -306,7 +306,6 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
     }
 
     function updatePool(uint256 _pid) public {
-        _maybeTopUpFromDripper();
         PoolInfo storage pool = poolInfo[_pid];
 
         uint256 lpSupply = pool.totalStaked;
@@ -333,6 +332,10 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
 
             pool.lastRewardBlock = block.number;
         }
+
+        // Run the low-water refill check after all reservations for this pool update are booked,
+        // so the dripper does not make decisions using temporarily overstated free liquidity.
+        _maybeTopUpFromDripper();
     }
 
     function notifyGaugeReward(uint256 _pid, uint256 _amount) external whenNotPaused nonReentrant {
@@ -342,11 +345,11 @@ contract ParagonFarmController is Ownable, AccessControlEnumerable, ReentrancyGu
 
         rewardToken.safeTransferFrom(msg.sender, address(this), _amount);
 
+        // Reserve the incoming gauge funding before any pool update can observe it as free liquidity.
+        _reservePoolRewards(_pid, _amount);
+
         // Settle pool before crediting new reward amount.
         updatePool(_pid);
-
-        // Reserve the newly funded gauge amount exactly once, here.
-        _reservePoolRewards(_pid, _amount);
 
         PoolInfo storage pool = poolInfo[_pid];
         if (pool.totalStaked > 0) {
