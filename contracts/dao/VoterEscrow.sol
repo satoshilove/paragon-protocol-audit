@@ -51,6 +51,7 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     event Supply(uint256 previousSupply, uint256 supply);
     event Checkpoint(uint256 indexed globalEpoch, uint256 ts, int128 bias, int128 slope);
     event RewardDepositorSet(address indexed depositor, bool allowed);
+    event UnlockTimeExtended(address indexed operator, address indexed beneficiary, uint256 locktime, uint256 ts);
 
     modifier onlyRewardDepositor() {
         require(rewardDepositors[msg.sender], "not reward depositor");
@@ -134,22 +135,16 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
     }
 
     function increase_unlock_time(uint256 newUnlockTime) external whenNotPaused nonReentrant {
-        LockedBalance memory oldLocked = locked[msg.sender];
-        require(oldLocked.amount > 0, "no lock");
-        require(oldLocked.end > block.timestamp, "expired");
+        _increaseUnlockTimeFor(msg.sender, msg.sender, newUnlockTime);
+    }
 
-        uint256 end = _roundDownWeek(newUnlockTime);
-        require(end > oldLocked.end, "not extended");
-        require(end >= block.timestamp + MIN_LOCK_TIME, "min 4 weeks");
-        require(end <= block.timestamp + MAXTIME, "end>maxtime");
-
-        LockedBalance memory newLocked = oldLocked;
-        newLocked.end = end;
-        locked[msg.sender] = newLocked;
-
-        _checkpoint(msg.sender, oldLocked, newLocked);
-
-        emit Deposit(msg.sender, msg.sender, 0, end, 2, block.timestamp);
+    function increase_unlock_time_for(address beneficiary, uint256 newUnlockTime)
+        external
+        whenNotPaused
+        nonReentrant
+        onlyRewardDepositor
+    {
+        _increaseUnlockTimeFor(msg.sender, beneficiary, newUnlockTime);
     }
 
     function withdraw() external nonReentrant {
@@ -184,19 +179,21 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
         require(end >= block.timestamp + MIN_LOCK_TIME, "min 4 weeks");
         require(end <= block.timestamp + MAXTIME, "end>maxtime");
 
+        uint256 supplyBefore = XPGN.balanceOf(address(this));
+        XPGN.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = XPGN.balanceOf(address(this)) - supplyBefore;
+        require(received == amount, "fee-on-transfer unsupported");
+
         LockedBalance memory newLocked = LockedBalance({
-            amount: _toInt128(amount),
+            amount: _toInt128(received),
             end: end
         });
 
-        uint256 supplyBefore = XPGN.balanceOf(address(this));
         locked[beneficiary] = newLocked;
 
         _checkpoint(beneficiary, oldLocked, newLocked);
 
-        XPGN.safeTransferFrom(msg.sender, address(this), amount);
-
-        emit Deposit(msg.sender, beneficiary, amount, end, 0, block.timestamp);
+        emit Deposit(msg.sender, beneficiary, received, end, 0, block.timestamp);
         emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
     }
 
@@ -208,18 +205,42 @@ contract VoterEscrow is Ownable, Pausable, ReentrancyGuard {
         require(oldLocked.amount > 0, "no lock");
         require(oldLocked.end > block.timestamp, "expired");
 
-        LockedBalance memory newLocked = oldLocked;
-        newLocked.amount += _toInt128(amount);
-
         uint256 supplyBefore = XPGN.balanceOf(address(this));
+        XPGN.safeTransferFrom(payer, address(this), amount);
+        uint256 received = XPGN.balanceOf(address(this)) - supplyBefore;
+        require(received == amount, "fee-on-transfer unsupported");
+
+        LockedBalance memory newLocked = oldLocked;
+        newLocked.amount += _toInt128(received);
+
         locked[beneficiary] = newLocked;
 
         _checkpoint(beneficiary, oldLocked, newLocked);
 
-        XPGN.safeTransferFrom(payer, address(this), amount);
-
-        emit Deposit(payer, beneficiary, amount, newLocked.end, 1, block.timestamp);
+        emit Deposit(payer, beneficiary, received, newLocked.end, 1, block.timestamp);
         emit Supply(supplyBefore, XPGN.balanceOf(address(this)));
+    }
+
+    function _increaseUnlockTimeFor(address operator, address beneficiary, uint256 newUnlockTime) internal {
+        require(beneficiary != address(0), "beneficiary=0");
+
+        LockedBalance memory oldLocked = locked[beneficiary];
+        require(oldLocked.amount > 0, "no lock");
+        require(oldLocked.end > block.timestamp, "expired");
+
+        uint256 end = _roundDownWeek(newUnlockTime);
+        require(end > oldLocked.end, "not extended");
+        require(end >= block.timestamp + MIN_LOCK_TIME, "min 4 weeks");
+        require(end <= block.timestamp + MAXTIME, "end>maxtime");
+
+        LockedBalance memory newLocked = oldLocked;
+        newLocked.end = end;
+        locked[beneficiary] = newLocked;
+
+        _checkpoint(beneficiary, oldLocked, newLocked);
+
+        emit Deposit(operator, beneficiary, 0, end, 2, block.timestamp);
+        emit UnlockTimeExtended(operator, beneficiary, end, block.timestamp);
     }
 
     // ============================================================

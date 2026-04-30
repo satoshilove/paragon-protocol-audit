@@ -9,9 +9,22 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 interface IParagonFarm {
     function depositFor(uint256 pid, uint256 amount, address user, address referrer) external;
     function withdraw(uint256 pid, uint256 amount) external;
+    function emergencyWithdraw(uint256 pid) external;
     function harvest(uint256 pid) external;
     function poolLpToken(uint256 pid) external view returns (address);
     function pendingReward(uint256 pid, address user) external view returns (uint256);
+    function poolInfo(uint256 pid)
+        external
+        view
+        returns (
+            IERC20 lpToken,
+            uint256 allocPoint,
+            uint256 lastRewardBlock,
+            uint256 accRewardPerShare,
+            uint256 harvestDelay,
+            uint256 totalStaked,
+            uint256 rewardTokenStaked
+        );
 }
 
 contract ParagonLockingVault is Ownable, ReentrancyGuard {
@@ -21,6 +34,7 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
         uint256 amount;      // LP principal
         uint64  unlockTime;  // unlock timestamp
         uint16  tier;        // 0=30d, 1=60d, 2=90d
+        uint16  penaltyBips; // early-unlock penalty snapshot
         uint256 rewardDebt;  // shares * accRewardPerShare / 1e12
         uint256 shares;      // amount * multiplierBips / 10000
     }
@@ -44,10 +58,14 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
 
     uint16  public earlyPenaltyBips = 250; // 2.5%
     bool    public emergencyMode;
+    bool    public farmEmergencyExited;
 
     // Reward accounting
     uint256 public accRewardPerShare; // scaled by 1e12
     uint256 public totalShares;
+    uint256 public unallocatedRewards;
+    mapping(address => uint256) public activePositionsCount;
+    mapping(address => uint256) public activePrincipal;
 
     mapping(address => Position[]) public positions;
 
@@ -63,6 +81,9 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
     event EmergencyModeUpdated(bool enabled);
     event DaoUpdated(address dao);
     event Rescued(address token, uint256 amount, address to);
+    event SurplusRewardsRescued(uint256 amount, address to);
+    event FarmEmergencyExited(uint256 amount);
+    event PositionIndexChanged(address indexed user, uint256 indexed fromIdx, uint256 indexed toIdx);
 
     constructor(
         address initialOwner,
@@ -81,6 +102,8 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
 
         // sanity: pool's LP must match
         require(IParagonFarm(_farm).poolLpToken(_pid) == _lpToken, "pool/lp mismatch");
+        (, , , , uint256 harvestDelay, , ) = IParagonFarm(_farm).poolInfo(_pid);
+        require(harvestDelay == 0, "pool harvest delay unsupported");
 
         // pre-approve farm with max to avoid repeated approvals
         lpToken.forceApprove(_farm, type(uint256).max);
@@ -93,8 +116,9 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
         _;
     }
 
-    function deposit(uint256 amount, uint8 tier, address referrer) external nonReentrant whenNotEmergency {
+    function deposit(uint256 amount, uint8 tier, address /*referrer*/ ) external nonReentrant whenNotEmergency {
         require(amount > 0, "amount=0");
+        require(!farmEmergencyExited, "farm exited");
         (uint64 duration, uint16 mult) = _tier(tier);
         uint64 unlockAt = uint64(block.timestamp) + duration;
 
@@ -102,15 +126,18 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
 
         uint256 shares = (amount * mult) / 10000;
         totalShares += shares;
+        activePositionsCount[msg.sender] += 1;
+        activePrincipal[msg.sender] += amount;
 
         // Pull LP into vault, then stake from vault into farm
         lpToken.safeTransferFrom(msg.sender, address(this), amount);
-        farm.depositFor(pid, amount, address(this), referrer);
+        farm.depositFor(pid, amount, address(this), address(0));
 
         Position memory p = Position({
             amount: amount,
             unlockTime: unlockAt,
             tier: uint16(tier),
+            penaltyBips: earlyPenaltyBips,
             rewardDebt: (shares * accRewardPerShare) / 1e12,
             shares: shares
         });
@@ -149,23 +176,30 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
     function unlock(uint256 idx) external nonReentrant {
         _harvest();
         Position storage p = positions[msg.sender][idx];
-        require(emergencyMode || block.timestamp >= p.unlockTime, "locked");
-
-        // pay rewards
-        uint256 pendingAmt = _pendingFor(p);
-        if (pendingAmt > 0) {
-            rewardToken.safeTransfer(msg.sender, pendingAmt);
-        }
+        require(p.amount > 0, "no pos");
+        require(emergencyMode || farmEmergencyExited || block.timestamp >= p.unlockTime, "locked");
 
         // withdraw principal from farm and send to user
         uint256 amount = p.amount;
         if (amount > 0) {
-            farm.withdraw(pid, amount);
+            if (!farmEmergencyExited) {
+                uint256 beforeBal = rewardToken.balanceOf(address(this));
+                farm.withdraw(pid, amount);
+                _indexExternalRewards(rewardToken.balanceOf(address(this)) - beforeBal);
+            }
             lpToken.safeTransfer(msg.sender, amount);
         }
 
+        // pay rewards after indexing any tokens that arrived during farm.withdraw
+        uint256 pendingAmt = _pendingFor(p);
+        if (pendingAmt > 0 && !emergencyMode && !farmEmergencyExited) {
+            rewardToken.safeTransfer(msg.sender, pendingAmt);
+        }
+
         totalShares -= p.shares;
-        _clearPosition(p);
+        activePositionsCount[msg.sender] -= 1;
+        activePrincipal[msg.sender] -= amount;
+        _removePosition(msg.sender, idx);
 
         emit Unlocked(msg.sender, idx, amount);
     }
@@ -175,24 +209,30 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
         Position storage p = positions[msg.sender][idx];
         require(p.amount > 0, "no pos");
 
-        // pay rewards
+        // withdraw principal and apply penalty
+        uint256 amount = p.amount;
+        if (!farmEmergencyExited) {
+            uint256 beforeBal = rewardToken.balanceOf(address(this));
+            farm.withdraw(pid, amount);
+            _indexExternalRewards(rewardToken.balanceOf(address(this)) - beforeBal);
+        }
+
+        // pay rewards after indexing any tokens that arrived during farm.withdraw
         uint256 pendingAmt = _pendingFor(p);
-        if (pendingAmt > 0) {
+        if (pendingAmt > 0 && !emergencyMode && !farmEmergencyExited) {
             rewardToken.safeTransfer(msg.sender, pendingAmt);
         }
 
-        // withdraw principal and apply penalty
-        uint256 amount = p.amount;
-        farm.withdraw(pid, amount);
-
-        uint256 penalty = (amount * earlyPenaltyBips) / 10000;
+        uint256 penalty = (amount * p.penaltyBips) / 10000;
         uint256 userAmt = amount - penalty;
 
         if (penalty > 0) lpToken.safeTransfer(dao, penalty);
         lpToken.safeTransfer(msg.sender, userAmt);
 
         totalShares -= p.shares;
-        _clearPosition(p);
+        activePositionsCount[msg.sender] -= 1;
+        activePrincipal[msg.sender] -= amount;
+        _removePosition(msg.sender, idx);
 
         emit EarlyUnlocked(msg.sender, idx, userAmt, penalty);
     }
@@ -203,18 +243,44 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
         _harvest();
     }
 
+    function triggerFarmEmergencyExit() external onlyOwner nonReentrant {
+        require(emergencyMode, "emergency");
+        require(!farmEmergencyExited, "already exited");
+        require(totalShares > 0, "no active positions");
+
+        // Best-effort reward settlement before the farm position is force-unwound.
+        uint256 beforeRewards = rewardToken.balanceOf(address(this));
+        try farm.harvest(pid) {
+            uint256 harvested = rewardToken.balanceOf(address(this)) - beforeRewards;
+            if (harvested > 0) {
+                accRewardPerShare += (harvested * 1e12) / totalShares;
+                emit Harvested(harvested);
+            }
+        } catch {}
+
+        uint256 beforeBal = lpToken.balanceOf(address(this));
+        farm.emergencyWithdraw(pid);
+        uint256 received = lpToken.balanceOf(address(this)) - beforeBal;
+
+        farmEmergencyExited = true;
+        emit FarmEmergencyExited(received);
+    }
+
     function setParams(
         uint64 _lock30, uint64 _lock60, uint64 _lock90,
         uint16 _mult30, uint16 _mult60, uint16 _mult90
     ) external onlyOwner {
+        require(_lock30 > 0 && _lock60 > 0 && _lock90 > 0, "lock=0");
+        require(_lock30 < _lock60 && _lock60 < _lock90, "bad lock order");
         require(_mult30 > 0 && _mult60 > 0 && _mult90 > 0, "mult=0");
+        require(_mult30 < _mult60 && _mult60 < _mult90, "bad mult order");
         lock30 = _lock30; lock60 = _lock60; lock90 = _lock90;
         mult30 = _mult30; mult60 = _mult60; mult90 = _mult90;
         emit ParamsUpdated(_lock30, _lock60, _lock90, _mult30, _mult60, _mult90);
     }
 
     function setEarlyPenaltyBips(uint16 bips) external onlyOwner {
-        require(bips <= 10000, "bips>10000");
+        require(bips <= 3000, "bips>3000");
         earlyPenaltyBips = bips;
         emit EarlyPenaltyUpdated(bips);
     }
@@ -237,6 +303,14 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
         emit Rescued(token, amount, to);
     }
 
+    function rescueSurplusRewards(uint256 amount, address to) external onlyOwner {
+        require(to != address(0), "zero");
+        require(amount <= unallocatedRewards, "amount too high");
+        unallocatedRewards -= amount;
+        rewardToken.safeTransfer(to, amount);
+        emit SurplusRewardsRescued(amount, to);
+    }
+
     // ---------------------------- Views ----------------------------
 
     function positionsLength(address user) external view returns (uint256) {
@@ -249,7 +323,7 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
         uint256 ts = totalShares;
 
         // simulate harvest view: add current farm pending as if applied now
-        if (ts > 0) {
+        if (ts > 0 && !farmEmergencyExited) {
             uint256 pendingFarm = farm.pendingReward(pid, address(this));
             if (pendingFarm > 0) {
                 acc += (pendingFarm * 1e12) / ts;
@@ -262,14 +336,11 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
     // ---------------------------- Internals ----------------------------
 
     function _harvest() internal {
+        if (farmEmergencyExited) return;
+
         uint256 beforeBal = rewardToken.balanceOf(address(this));
         farm.harvest(pid); // farm pays rewards to this vault
-        uint256 harvested = rewardToken.balanceOf(address(this)) - beforeBal;
-
-        if (harvested > 0 && totalShares > 0) {
-            accRewardPerShare += (harvested * 1e12) / totalShares;
-            emit Harvested(harvested);
-        }
+        _indexExternalRewards(rewardToken.balanceOf(address(this)) - beforeBal);
     }
 
     function _pendingFor(Position memory p) internal view returns (uint256) {
@@ -284,10 +355,27 @@ contract ParagonLockingVault is Ownable, ReentrancyGuard {
         revert("bad tier");
     }
 
-    function _clearPosition(Position storage p) internal {
-        p.amount = 0;
-        p.shares = 0;
-        p.rewardDebt = 0;
-        p.unlockTime = uint64(block.timestamp);
+    function _indexExternalRewards(uint256 harvested) internal {
+        if (harvested == 0) return;
+
+        if (totalShares == 0) {
+            unallocatedRewards += harvested;
+            return;
+        }
+
+        accRewardPerShare += (harvested * 1e12) / totalShares;
+        emit Harvested(harvested);
+    }
+
+    function _removePosition(address user, uint256 idx) internal {
+        Position[] storage arr = positions[user];
+        uint256 last = arr.length - 1;
+
+        if (idx != last) {
+            arr[idx] = arr[last];
+            emit PositionIndexChanged(user, last, idx);
+        }
+
+        arr.pop();
     }
 }

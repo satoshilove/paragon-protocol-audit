@@ -13,4 +13,8 @@ interface IVoterEscrowLocking {
         uint256 unlockTime,
         address to
     ) external returns (uint256 tokenId);
+
+    function increase_amount_for(address beneficiary, uint256 amount) external;
+
+    function increase_unlock_time_for(address beneficiary, uint256 newUnlockTime) external;
 }
