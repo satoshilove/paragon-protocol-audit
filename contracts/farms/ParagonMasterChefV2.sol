@@ -62,6 +62,7 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
 
     uint256 public rewardLiability;
     uint256 public totalUnpaidRewards;
+    uint256 public unpaidDevRewards;
     uint256 public lowWaterBlocks = 115_200;
     uint64 public dripCooldownSecs = 900;
     uint64 public lastDripAt;
@@ -241,7 +242,8 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         _updatePool(_pid);
-        _harvest(_pid, _user, pool, user);
+        if (paused()) _accrueUnpaid(pool, user);
+        else _harvest(_pid, _user, pool, user);
         pool.totalBoostedShare = pool.totalBoostedShare - user.boostedAmount;
         user.boostBips = _boostBips;
         user.boostedAmount = _boosted(user.amount, _boostBips);
@@ -273,7 +275,8 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
 
     function unreservedRewardBalance() public view returns (uint256) {
         uint256 available = availableRewardBalance();
-        return available > rewardLiability ? available - rewardLiability : 0;
+        uint256 reserved = rewardLiability + unpaidDevRewards;
+        return available > reserved ? available - reserved : 0;
     }
 
     function massUpdatePools() external nonReentrant {
@@ -281,17 +284,18 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     function updatePool(uint256 _pid) external nonReentrant {
-        _updatePool(_pid);
+        _updatePool(_pid, true, !paused());
     }
 
     function _massUpdatePools() private {
         uint256 length = poolInfo.length;
-        for (uint256 pid = 0; pid < length; ++pid) { _updatePool(pid, false); }
+        bool payDev = !paused();
+        for (uint256 pid = 0; pid < length; ++pid) { _updatePool(pid, false, payDev); }
         _maybeTopUpFromDripper();
     }
 
     function _updatePool(uint256 _pid) private {
-        _updatePool(_pid, true, true);
+        _updatePool(_pid, true, !paused());
     }
 
     function _updatePool(uint256 _pid, bool _topUpAfter) private {
@@ -320,8 +324,9 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
             pool.accRewardPerShare += (netReward * ACC_REWARD_PRECISION) / pool.totalBoostedShare;
             rewardLiability += netReward;
         }
-        if (_payDev && devReward > 0) {
-            _safeRewardTransfer(devAddress, devReward);
+        if (devReward > 0) {
+            if (_payDev) _payDevRewards(devReward);
+            else unpaidDevRewards += devReward;
         }
         if (_topUpAfter) _maybeTopUpFromDripper();
     }
@@ -438,11 +443,28 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 pending = _pending(_pool, _user);
         if (pending == 0) return;
         uint256 ownUnpaid = _user.unpaidRewards;
-        uint256 payableAmount = totalUnpaidRewards > ownUnpaid ? ownUnpaid : pending;
+        uint256 reservedForOthers = totalUnpaidRewards - ownUnpaid;
+        uint256 available = availableRewardBalance();
+        uint256 payableAmount = available > reservedForOthers ? available - reservedForOthers : 0;
+        if (payableAmount > pending) payableAmount = pending;
         uint256 paid = _safeRewardTransfer(_to, payableAmount);
         _setUnpaid(_user, pending - paid);
         _releaseLiability(paid);
         emit Harvest(_to, _pid, paid, _user.unpaidRewards);
+    }
+
+    function _payDevRewards(uint256 _currentDevReward) private {
+        uint256 owed = unpaidDevRewards + _currentDevReward;
+        unpaidDevRewards = 0;
+        uint256 available = availableRewardBalance();
+        if (available <= rewardLiability) {
+            unpaidDevRewards = owed;
+            return;
+        }
+        uint256 devPayable = available - rewardLiability;
+        if (devPayable > owed) devPayable = owed;
+        uint256 paid = _safeRewardTransfer(devAddress, devPayable);
+        if (paid < owed) unpaidDevRewards = owed - paid;
     }
 
     function _accrueUnpaid(PoolInfo storage _pool, UserInfo storage _user) private {
@@ -469,11 +491,13 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
         if (address(dripper) == address(0)) return;
         if (block.timestamp < lastDripAt + dripCooldownSecs) return;
         uint256 need = rewardPerBlock * _bufferBlocksRemaining();
-        if (unreservedRewardBalance() >= need && availableRewardBalance() >= rewardLiability) return;
+        uint256 reserved = rewardLiability + unpaidDevRewards;
+        if (unreservedRewardBalance() >= need && availableRewardBalance() >= reserved) return;
         try dripper.pendingAccrued() returns (uint256 pending) {
             if (pending >= minDripAmount) {
                 try dripper.drip() returns (uint256 sent) {
-                    if (sent > 0 && unreservedRewardBalance() >= need && availableRewardBalance() >= rewardLiability) {
+                    reserved = rewardLiability + unpaidDevRewards;
+                    if (sent > 0 && unreservedRewardBalance() >= need && availableRewardBalance() >= reserved) {
                         lastDripAt = uint64(block.timestamp);
                     }
                     emit DripperPoked(sent, availableRewardBalance());
