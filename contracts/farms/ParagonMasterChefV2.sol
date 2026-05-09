@@ -60,8 +60,8 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
     uint16 public devFeeBips;
     uint256 public maxRewardPerBlock = type(uint256).max;
 
-    uint256 public totalRewardTokenStakedAsLP;
     uint256 public rewardLiability;
+    uint256 public totalUnpaidRewards;
     uint256 public lowWaterBlocks = 115_200;
     uint64 public dripCooldownSecs = 900;
     uint64 public lastDripAt;
@@ -126,6 +126,7 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
         bool _withUpdate
     ) external onlyOwner nonReentrant {
         require(address(_lpToken) != address(0), "lp=0");
+        require(address(_lpToken) != address(rewardToken), "reward lp");
         require(!lpTokenAdded[address(_lpToken)], "lp exists");
         require(poolInfo.length < MAX_POOLS, "max pools");
         _withUpdate;
@@ -182,8 +183,10 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
 
     function setEndBlock(uint256 _endBlock) external onlyOwner nonReentrant {
         require(_endBlock == 0 || _endBlock > block.number, "bad end");
+        bool renewsExpiredFarm = endBlock != 0 && block.number > endBlock && (_endBlock == 0 || _endBlock > block.number);
         _massUpdatePools();
         emit RewardEndBlockUpdated(endBlock, _endBlock);
+        if (renewsExpiredFarm) _checkpointPools(block.number);
         endBlock = _endBlock;
     }
 
@@ -265,8 +268,7 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     function availableRewardBalance() public view returns (uint256) {
-        uint256 balance = rewardToken.balanceOf(address(this));
-        return balance > totalRewardTokenStakedAsLP ? balance - totalRewardTokenStakedAsLP : 0;
+        return rewardToken.balanceOf(address(this));
     }
 
     function unreservedRewardBalance() public view returns (uint256) {
@@ -289,15 +291,23 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     function _updatePool(uint256 _pid) private {
-        _updatePool(_pid, true);
+        _updatePool(_pid, true, true);
     }
 
     function _updatePool(uint256 _pid, bool _topUpAfter) private {
+        _updatePool(_pid, _topUpAfter, true);
+    }
+
+    function _updatePool(uint256 _pid, bool _topUpAfter, bool _payDev) private {
         PoolInfo storage pool = poolInfo[_pid];
         uint256 toBlock = _effectiveBlock(block.number);
-        if (toBlock <= pool.lastRewardBlock) return;
+        if (toBlock <= pool.lastRewardBlock) {
+            if (_topUpAfter) _maybeTopUpFromDripper();
+            return;
+        }
         if (pool.totalBoostedShare == 0 || pool.allocPoint == 0) {
             pool.lastRewardBlock = toBlock;
+            if (_topUpAfter) _maybeTopUpFromDripper();
             return;
         }
         uint256 reward = _poolReward(pool, pool.lastRewardBlock, toBlock);
@@ -310,7 +320,7 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
             pool.accRewardPerShare += (netReward * ACC_REWARD_PRECISION) / pool.totalBoostedShare;
             rewardLiability += netReward;
         }
-        if (devReward > 0) {
+        if (_payDev && devReward > 0) {
             _safeRewardTransfer(devAddress, devReward);
         }
         if (_topUpAfter) _maybeTopUpFromDripper();
@@ -321,6 +331,7 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     function depositFor(uint256 _pid, uint256 _amount, address _receiver) external nonReentrant whenNotPaused {
+        require(msg.sender == _receiver || specialDepositor[msg.sender] || msg.sender == owner(), "depositFor not allowed");
         _deposit(_pid, _amount, msg.sender, _receiver);
     }
 
@@ -332,12 +343,12 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
         if (paused()) _accrueUnpaid(pool, user);
         else _harvest(_pid, msg.sender, pool, user);
         if (_amount > 0) {
+            _assertPoolCustody(pool);
             uint256 oldBoosted = user.boostedAmount;
             user.amount -= _amount;
             user.boostedAmount = _boosted(user.amount, _userBoostBips(user));
             pool.totalStaked -= _amount;
             pool.totalBoostedShare = pool.totalBoostedShare - oldBoosted + user.boostedAmount;
-            if (address(pool.lpToken) == address(rewardToken)) totalRewardTokenStakedAsLP -= _amount;
             pool.lpToken.safeTransfer(msg.sender, _amount);
         }
         user.rewardDebt = (user.boostedAmount * pool.accRewardPerShare) / ACC_REWARD_PRECISION;
@@ -356,20 +367,20 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
     function emergencyWithdraw(uint256 _pid) external nonReentrant {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-        _updatePool(_pid);
+        _updatePool(_pid, false, false);
 
         uint256 amount = user.amount;
         uint256 boostedAmount = user.boostedAmount;
         uint256 forfeited = _pending(pool, user);
         if (forfeited > 0) _releaseLiability(forfeited);
 
+        _assertPoolCustody(pool);
         user.amount = 0;
         user.boostedAmount = 0;
         user.rewardDebt = 0;
-        user.unpaidRewards = 0;
+        _setUnpaid(user, 0);
         pool.totalStaked -= amount;
         pool.totalBoostedShare -= boostedAmount;
-        if (address(pool.lpToken) == address(rewardToken)) totalRewardTokenStakedAsLP -= amount;
         pool.lpToken.safeTransfer(msg.sender, amount);
         emit EmergencyWithdraw(msg.sender, _pid, amount);
     }
@@ -384,6 +395,7 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
 
     function recoverRewardTokens(address _to, uint256 _amount) external onlyOwner nonReentrant {
         require(_to != address(0), "to=0");
+        _massUpdatePools();
         require(_amount <= unreservedRewardBalance(), "exceeds rewards");
         rewardToken.safeTransfer(_to, _amount);
         emit RewardTokensRecovered(_to, _amount);
@@ -400,6 +412,7 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
 
     function _deposit(uint256 _pid, uint256 _amount, address _from, address _receiver) private {
         require(_receiver != address(0), "receiver=0");
+        require(_receiver != address(this), "receiver=farm");
         require(_amount > 0 || _from == _receiver, "zero depositFor");
         PoolInfo storage pool = poolInfo[_pid];
         require(!pool.depositsRestricted || specialDepositor[_from] || _from == owner(), "restricted");
@@ -416,7 +429,6 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
             user.boostedAmount = _boosted(user.amount, _userBoostBips(user));
             pool.totalStaked += received;
             pool.totalBoostedShare = pool.totalBoostedShare - oldBoosted + user.boostedAmount;
-            if (address(pool.lpToken) == address(rewardToken)) totalRewardTokenStakedAsLP += received;
         }
         user.rewardDebt = (user.boostedAmount * pool.accRewardPerShare) / ACC_REWARD_PRECISION;
         emit Deposit(_from, _pid, _amount, _receiver);
@@ -425,30 +437,38 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
     function _harvest(uint256 _pid, address _to, PoolInfo storage _pool, UserInfo storage _user) private {
         uint256 pending = _pending(_pool, _user);
         if (pending == 0) return;
-        uint256 paid = _safeRewardTransfer(_to, pending);
-        _user.unpaidRewards = pending - paid;
+        uint256 ownUnpaid = _user.unpaidRewards;
+        uint256 payableAmount = totalUnpaidRewards > ownUnpaid ? ownUnpaid : pending;
+        uint256 paid = _safeRewardTransfer(_to, payableAmount);
+        _setUnpaid(_user, pending - paid);
         _releaseLiability(paid);
         emit Harvest(_to, _pid, paid, _user.unpaidRewards);
     }
 
     function _accrueUnpaid(PoolInfo storage _pool, UserInfo storage _user) private {
-        _user.unpaidRewards = _pending(_pool, _user);
+        _setUnpaid(_user, _pending(_pool, _user));
     }
 
     function _safeRewardTransfer(address _to, uint256 _amount) private returns (uint256 paid) {
         uint256 available = availableRewardBalance();
         paid = _amount > available ? available : _amount;
         if (paid > 0) {
-            uint256 beforeBalance = rewardToken.balanceOf(_to);
+            uint256 beforeBalance = rewardToken.balanceOf(address(this));
+            uint256 beforeRecipient = rewardToken.balanceOf(_to);
             rewardToken.safeTransfer(_to, paid);
-            paid = rewardToken.balanceOf(_to) - beforeBalance;
+            uint256 afterBalance = rewardToken.balanceOf(address(this));
+            uint256 afterRecipient = rewardToken.balanceOf(_to);
+            require(beforeBalance >= afterBalance, "reward balance increased");
+            uint256 debited = beforeBalance - afterBalance;
+            require(debited == paid, "nonstandard reward");
+            require(afterRecipient >= beforeRecipient && afterRecipient - beforeRecipient == paid, "nonstandard reward");
         }
     }
 
     function _maybeTopUpFromDripper() private {
         if (address(dripper) == address(0)) return;
         if (block.timestamp < lastDripAt + dripCooldownSecs) return;
-        uint256 need = rewardPerBlock * lowWaterBlocks;
+        uint256 need = rewardPerBlock * _bufferBlocksRemaining();
         if (unreservedRewardBalance() >= need && availableRewardBalance() >= rewardLiability) return;
         try dripper.pendingAccrued() returns (uint256 pending) {
             if (pending >= minDripAmount) {
@@ -497,6 +517,32 @@ contract ParagonMasterChefV2 is Ownable2Step, Pausable, ReentrancyGuard {
 
     function _releaseLiability(uint256 _amount) private {
         rewardLiability = _amount > rewardLiability ? 0 : rewardLiability - _amount;
+    }
+
+    function _setUnpaid(UserInfo storage _user, uint256 _newUnpaid) private {
+        uint256 oldUnpaid = _user.unpaidRewards;
+        if (_newUnpaid > oldUnpaid) totalUnpaidRewards += _newUnpaid - oldUnpaid;
+        else totalUnpaidRewards -= oldUnpaid - _newUnpaid;
+        _user.unpaidRewards = _newUnpaid;
+    }
+
+    function _checkpointPools(uint256 _blockNumber) private {
+        uint256 length = poolInfo.length;
+        for (uint256 pid = 0; pid < length; ++pid) {
+            poolInfo[pid].lastRewardBlock = _blockNumber;
+        }
+    }
+
+    function _bufferBlocksRemaining() private view returns (uint256) {
+        if (rewardPerBlock == 0) return 0;
+        if (endBlock == 0) return lowWaterBlocks;
+        if (block.number >= endBlock) return 0;
+        uint256 remaining = endBlock - block.number;
+        return remaining < lowWaterBlocks ? remaining : lowWaterBlocks;
+    }
+
+    function _assertPoolCustody(PoolInfo storage _pool) private view {
+        require(_pool.lpToken.balanceOf(address(this)) >= _pool.totalStaked, "lp undercollateralized");
     }
 
     function _increaseAlloc(bool _isRegular, uint256 _allocPoint) private {
